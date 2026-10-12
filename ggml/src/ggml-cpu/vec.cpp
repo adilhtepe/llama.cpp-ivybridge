@@ -579,17 +579,6 @@ ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float 
         val2 = _mm_add_ss(val2, _mm_movehdup_ps(val2));
         sum += (ggml_float)_mm_cvtss_f32(val2);
     }
-#elif defined(__AVX__)
-    for (; i + 7 < n; i += 8) {
-        __m256 val = ggml_v_expf_x8(_mm256_sub_ps(_mm256_loadu_ps(x + i),
-                                                  _mm256_set1_ps(max)));
-        _mm256_storeu_ps(y + i, val);
-        __m128 val2 = _mm_add_ps(_mm256_extractf128_ps(val, 1),
-                                 _mm256_castps256_ps128(val));
-        val2 = _mm_add_ps(val2, _mm_movehl_ps(val2, val2));
-        val2 = _mm_add_ss(val2, _mm_movehdup_ps(val2));
-        sum += (ggml_float)_mm_cvtss_f32(val2);
-    }
 #elif defined(__SSE2__)
     for (; i + 3 < n; i += 4) {
         __m128 val = ggml_v_expf(_mm_sub_ps(_mm_loadu_ps(x + i),
