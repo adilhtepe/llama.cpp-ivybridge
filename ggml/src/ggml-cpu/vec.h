@@ -582,6 +582,35 @@ inline static void ggml_vec_mad_f16(const int n, ggml_fp16_t * GGML_RESTRICT y, 
     }
 }
 
+// y (f32) += x (f16) * v
+inline static void ggml_vec_mad_f16_f32(const int n, float * GGML_RESTRICT y, const ggml_fp16_t * GGML_RESTRICT x, const float v) {
+#if defined(__AVX__) && defined(__F16C__)
+    const int np = (n & ~(GGML_F32_STEP - 1));
+
+    GGML_F32x8 vx = GGML_F32x8_SET1(v);
+
+    GGML_F32x8 ax[GGML_F32_ARR];
+    GGML_F32x8 ay[GGML_F32_ARR];
+
+    for (int i = 0; i < np; i += GGML_F32_STEP) {
+        for (int j = 0; j < GGML_F32_ARR; j++) {
+            ax[j] = GGML_F32Cx8_LOAD(x + i + j*GGML_F32_EPR);
+            ay[j] = GGML_F32x8_LOAD(y + i + j*GGML_F32_EPR);
+            ay[j] = GGML_F32x8_FMA(ay[j], ax[j], vx);
+
+            GGML_F32x8_STORE(y + i + j*GGML_F32_EPR, ay[j]);
+        }
+    }
+#else
+    const int np = 0;
+#endif
+
+    // scalar and leftovers
+    for (int i = np; i < n; ++i) {
+        y[i] += GGML_CPU_FP16_TO_FP32(x[i])*v;
+    }
+}
+
 // xs and vs are byte strides of x and v
 inline static void ggml_vec_mad_f32_unroll(const int n, const int xs, const int vs, float * GGML_RESTRICT y, const float * GGML_RESTRICT xv, const float * GGML_RESTRICT vv) {
 
@@ -1444,6 +1473,57 @@ inline static vfloat32m2_t ggml_v_silu_m2(vfloat32m2_t x, int vl) {
 }
 
 #endif // __ARM_NEON / __AVX2__ / __SSE2__ / __riscv_v_intrinsic
+
+#if defined(__AVX__) && !(defined(__AVX2__) && defined(__FMA__))
+
+#define MADD256(x, y, z) _mm256_add_ps(_mm256_mul_ps(x, y), z)
+#define NMADD256(x, y, z) _mm256_sub_ps(z, _mm256_mul_ps(x, y))
+
+// 8-wide version of the __m128 routine above for AVX without AVX2/FMA: float ops are 256-bit,
+// the few integer ops are done per 128-bit half
+// the maximum error is 1.45358 plus 0.5 ulps
+// numbers above 88.38 will flush to infinity
+// numbers beneath -103.97 will flush to zero
+inline static __m256 ggml_v_expf_x8(__m256 x) {
+    const __m256 r = _mm256_set1_ps(0x1.8p23f);
+    const __m256 z = MADD256(x, _mm256_set1_ps(0x1.715476p+0f), r);
+    const __m256 n = _mm256_sub_ps(z, r);
+    const __m256 b =
+        NMADD256(n, _mm256_set1_ps(0x1.7f7d1cp-20f), NMADD256(n, _mm256_set1_ps(0x1.62e4p-1f), x));
+    const __m128i e_lo = _mm_slli_epi32(_mm_castps_si128(_mm256_castps256_ps128(z)), 23);
+    const __m128i e_hi = _mm_slli_epi32(_mm_castps_si128(_mm256_extractf128_ps(z, 1)), 23);
+    const __m128i one  = _mm_castps_si128(_mm_set1_ps(1));
+    const __m256 k = _mm256_insertf128_ps(
+        _mm256_castps128_ps256(_mm_castsi128_ps(_mm_add_epi32(e_lo, one))),
+        _mm_castsi128_ps(_mm_add_epi32(e_hi, one)), 1);
+    const __m256 c = _mm256_cmp_ps(_mm256_andnot_ps(_mm256_set1_ps(-0.f), n), _mm256_set1_ps(126), _CMP_GT_OQ);
+    const __m256 u = _mm256_mul_ps(b, b);
+    const __m256 j =
+        MADD256(MADD256(MADD256(_mm256_set1_ps(0x1.0e4020p-7f), b, _mm256_set1_ps(0x1.573e2ep-5f)), u,
+                        MADD256(_mm256_set1_ps(0x1.555e66p-3f), b, _mm256_set1_ps(0x1.fffdb6p-2f))),
+                u, _mm256_mul_ps(_mm256_set1_ps(0x1.ffffecp-1f), b));
+    if (!_mm256_movemask_ps(c))
+        return MADD256(j, k, k);
+    const __m256 g = _mm256_and_ps(_mm256_cmp_ps(n, _mm256_setzero_ps(), _CMP_LE_OQ),
+                                   _mm256_castsi256_ps(_mm256_set1_epi32(0x82000000u)));
+    const __m128i g_lo = _mm_castps_si128(_mm256_castps256_ps128(g));
+    const __m128i g_hi = _mm_castps_si128(_mm256_extractf128_ps(g, 1));
+    const __m128i s1c  = _mm_set1_epi32(0x7f000000u);
+    const __m256 s1 = _mm256_insertf128_ps(
+        _mm256_castps128_ps256(_mm_castsi128_ps(_mm_add_epi32(g_lo, s1c))),
+        _mm_castsi128_ps(_mm_add_epi32(g_hi, s1c)), 1);
+    const __m256 s2 = _mm256_insertf128_ps(
+        _mm256_castps128_ps256(_mm_castsi128_ps(_mm_sub_epi32(e_lo, g_lo))),
+        _mm_castsi128_ps(_mm_sub_epi32(e_hi, g_hi)), 1);
+    const __m256 d = _mm256_cmp_ps(_mm256_andnot_ps(_mm256_set1_ps(-0.f), n), _mm256_set1_ps(192), _CMP_GT_OQ);
+    return _mm256_or_ps(
+        _mm256_and_ps(d, _mm256_mul_ps(s1, s1)),
+        _mm256_andnot_ps(d,
+                         _mm256_or_ps(_mm256_and_ps(c, _mm256_mul_ps(MADD256(s2, j, s2), s1)),
+                                      _mm256_andnot_ps(c, MADD256(k, j, k)))));
+}
+
+#endif // __AVX__ && !(__AVX2__ && __FMA__)
 
 inline static void ggml_vec_silu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
     for (int i = 0; i < n; ++i) {
