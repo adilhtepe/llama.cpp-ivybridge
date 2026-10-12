@@ -268,6 +268,20 @@ static inline __m256 quad_fp16_delta_float(const float x0, const float y0, const
                            _mm_set1_ps(GGML_CPU_FP16_TO_FP32(x0) * GGML_CPU_FP16_TO_FP32(y0)));
 }
 
+#if defined(__F16C__)
+// deltas of four consecutive block pairs, converted with a single vector instruction:
+// d01 = { x0*y0 (x4), x1*y1 (x4) }, d23 = { x2*y2 (x4), x3*y3 (x4) }
+static inline void oct_fp16_delta_float(const ggml_fp16_t x0, const ggml_fp16_t x1, const ggml_fp16_t x2, const ggml_fp16_t x3,
+                                        const ggml_fp16_t y0, const ggml_fp16_t y1, const ggml_fp16_t y2, const ggml_fp16_t y3,
+                                        __m256 * d01, __m256 * d23) {
+    const __m128i h = _mm_set_epi16(y3, y2, y1, y0, x3, x2, x1, x0);
+    const __m256 dd = _mm256_cvtph_ps(h);
+    const __m256 prod = _mm256_mul_ps(dd, _mm256_permute2f128_ps(dd, dd, 1));
+    *d01 = _mm256_permutevar_ps(prod, _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1));
+    *d23 = _mm256_permutevar_ps(prod, _mm256_setr_epi32(2, 2, 2, 2, 3, 3, 3, 3));
+}
+#endif
+
 static inline __m256 quad_mx_delta_float(const uint8_t x0, const float y0, const uint8_t x1, const float y1) {
     return _mm256_set_m128(_mm_set1_ps(GGML_CPU_E8M0_TO_FP32_HALF(x1) * GGML_CPU_FP16_TO_FP32(y1)),
                            _mm_set1_ps(GGML_CPU_E8M0_TO_FP32_HALF(x0) * GGML_CPU_FP16_TO_FP32(y0)));
@@ -824,6 +838,44 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     sumf = hsum_float_8(acc);
 #elif defined(__AVX__)
     __m256 accum = _mm256_setzero_ps();
+#if defined(__F16C__)
+    for (; ib + 3 < nb; ib += 4) {
+        const __m128i q4bits_1 = _mm_loadu_si128((const __m128i *)x[ib + 0].qs);
+        const __m128i q4bits_2 = _mm_loadu_si128((const __m128i *)x[ib + 1].qs);
+        const __m128i q4bits_3 = _mm_loadu_si128((const __m128i *)x[ib + 2].qs);
+        const __m128i q4bits_4 = _mm_loadu_si128((const __m128i *)x[ib + 3].qs);
+        const __m128i q8b_1_0 = _mm_loadu_si128((const __m128i *)y[ib + 0].qs);
+        const __m128i q8b_1_1 = _mm_loadu_si128((const __m128i *)y[ib + 0].qs + 1);
+        const __m128i q8b_2_0 = _mm_loadu_si128((const __m128i *)y[ib + 1].qs);
+        const __m128i q8b_2_1 = _mm_loadu_si128((const __m128i *)y[ib + 1].qs + 1);
+        const __m128i q8b_3_0 = _mm_loadu_si128((const __m128i *)y[ib + 2].qs);
+        const __m128i q8b_3_1 = _mm_loadu_si128((const __m128i *)y[ib + 2].qs + 1);
+        const __m128i q8b_4_0 = _mm_loadu_si128((const __m128i *)y[ib + 3].qs);
+        const __m128i q8b_4_1 = _mm_loadu_si128((const __m128i *)y[ib + 3].qs + 1);
+
+        const __m128i q4b_1_0 = _mm_sub_epi8(_mm_and_si128(_mm_set1_epi8(15), q4bits_1), _mm_set1_epi8(8));
+        const __m128i q4b_1_1 = _mm_sub_epi8(_mm_and_si128(_mm_set1_epi8(15), _mm_srli_epi16(q4bits_1, 4)), _mm_set1_epi8(8));
+        const __m128i q4b_2_0 = _mm_sub_epi8(_mm_and_si128(_mm_set1_epi8(15), q4bits_2), _mm_set1_epi8(8));
+        const __m128i q4b_2_1 = _mm_sub_epi8(_mm_and_si128(_mm_set1_epi8(15), _mm_srli_epi16(q4bits_2, 4)), _mm_set1_epi8(8));
+        const __m128i q4b_3_0 = _mm_sub_epi8(_mm_and_si128(_mm_set1_epi8(15), q4bits_3), _mm_set1_epi8(8));
+        const __m128i q4b_3_1 = _mm_sub_epi8(_mm_and_si128(_mm_set1_epi8(15), _mm_srli_epi16(q4bits_3, 4)), _mm_set1_epi8(8));
+        const __m128i q4b_4_0 = _mm_sub_epi8(_mm_and_si128(_mm_set1_epi8(15), q4bits_4), _mm_set1_epi8(8));
+        const __m128i q4b_4_1 = _mm_sub_epi8(_mm_and_si128(_mm_set1_epi8(15), _mm_srli_epi16(q4bits_4, 4)), _mm_set1_epi8(8));
+
+        const __m128i p_1 = _mm_add_epi16(mul_add_epi8_sse(q4b_1_0, q8b_1_0), mul_add_epi8_sse(q4b_1_1, q8b_1_1));
+        const __m128i p_2 = _mm_add_epi16(mul_add_epi8_sse(q4b_2_0, q8b_2_0), mul_add_epi8_sse(q4b_2_1, q8b_2_1));
+        const __m128i p_3 = _mm_add_epi16(mul_add_epi8_sse(q4b_3_0, q8b_3_0), mul_add_epi8_sse(q4b_3_1, q8b_3_1));
+        const __m128i p_4 = _mm_add_epi16(mul_add_epi8_sse(q4b_4_0, q8b_4_0), mul_add_epi8_sse(q4b_4_1, q8b_4_1));
+        const __m256 p_12 = sum_i16_pairs_float(p_2, p_1);
+        const __m256 p_34 = sum_i16_pairs_float(p_4, p_3);
+
+        __m256 d_12, d_34;
+        oct_fp16_delta_float(x[ib].d, x[ib + 1].d, x[ib + 2].d, x[ib + 3].d,
+                             y[ib].d, y[ib + 1].d, y[ib + 2].d, y[ib + 3].d, &d_12, &d_34);
+        accum = _mm256_add_ps(_mm256_mul_ps(d_12, p_12), accum);
+        accum = _mm256_add_ps(_mm256_mul_ps(d_34, p_34), accum);
+    }
+#endif
     for (; ib + 1 < nb; ib += 2) {
         const __m128i q4bits_1 = _mm_loadu_si128((const __m128i *)x[ib + 0].qs);
         const __m128i q4bits_2 = _mm_loadu_si128((const __m128i *)x[ib + 1].qs);
@@ -1426,6 +1478,35 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #elif defined(__AVX__)
     __m256 accum = _mm256_setzero_ps();
 
+#if defined(__F16C__)
+    for (; ib + 3 < nb; ib += 4) {
+        const __m128i qx_1_0 = _mm_loadu_si128((const __m128i *)x[ib].qs);
+        const __m128i qx_1_1 = _mm_loadu_si128((const __m128i *)x[ib].qs + 1);
+        const __m128i qx_2_0 = _mm_loadu_si128((const __m128i *)x[ib + 1].qs);
+        const __m128i qx_2_1 = _mm_loadu_si128((const __m128i *)x[ib + 1].qs + 1);
+        const __m128i qx_3_0 = _mm_loadu_si128((const __m128i *)x[ib + 2].qs);
+        const __m128i qx_3_1 = _mm_loadu_si128((const __m128i *)x[ib + 2].qs + 1);
+        const __m128i qx_4_0 = _mm_loadu_si128((const __m128i *)x[ib + 3].qs);
+        const __m128i qx_4_1 = _mm_loadu_si128((const __m128i *)x[ib + 3].qs + 1);
+        const __m128i qy_1_0 = _mm_loadu_si128((const __m128i *)y[ib].qs);
+        const __m128i qy_1_1 = _mm_loadu_si128((const __m128i *)y[ib].qs + 1);
+        const __m128i qy_2_0 = _mm_loadu_si128((const __m128i *)y[ib + 1].qs);
+        const __m128i qy_2_1 = _mm_loadu_si128((const __m128i *)y[ib + 1].qs + 1);
+        const __m128i qy_3_0 = _mm_loadu_si128((const __m128i *)y[ib + 2].qs);
+        const __m128i qy_3_1 = _mm_loadu_si128((const __m128i *)y[ib + 2].qs + 1);
+        const __m128i qy_4_0 = _mm_loadu_si128((const __m128i *)y[ib + 3].qs);
+        const __m128i qy_4_1 = _mm_loadu_si128((const __m128i *)y[ib + 3].qs + 1);
+
+        const __m256 p_12 = mul_sum_i8_quad_float(qx_1_0, qx_1_1, qx_2_0, qx_2_1, qy_1_0, qy_1_1, qy_2_0, qy_2_1);
+        const __m256 p_34 = mul_sum_i8_quad_float(qx_3_0, qx_3_1, qx_4_0, qx_4_1, qy_3_0, qy_3_1, qy_4_0, qy_4_1);
+
+        __m256 d_12, d_34;
+        oct_fp16_delta_float(x[ib].d, x[ib + 1].d, x[ib + 2].d, x[ib + 3].d,
+                             y[ib].d, y[ib + 1].d, y[ib + 2].d, y[ib + 3].d, &d_12, &d_34);
+        accum = _mm256_add_ps(_mm256_mul_ps(d_12, p_12), accum);
+        accum = _mm256_add_ps(_mm256_mul_ps(d_34, p_34), accum);
+    }
+#endif
     for (; ib + 1 < nb; ib += 2) {
         const __m128i qx_1_0 = _mm_loadu_si128((const __m128i *)x[ib].qs);
         const __m128i qx_1_1 = _mm_loadu_si128((const __m128i *)x[ib].qs + 1);
