@@ -12244,6 +12244,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
     }
 
+    // Qwen3-30B-A3B-shaped attention (32 q heads over 4 kv heads, head size 128) at long KV:
+    // single-token decode (nb=1) and the prompt tile width (nb=32) with f16 and q8_0 caches
+    for (int64_t kv : {4096, 8192}) {
+        for (int64_t nb : {1, 32}) {
+            for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));

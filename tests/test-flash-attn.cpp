@@ -209,7 +209,7 @@ static void test_nan_propagation(ggml_backend_t backend, int64_t DK, int64_t n_k
     srand(0xBEEF);
 
     const int64_t n_head = 2;
-    const int64_t nan_iq = 1; // query row that is set to NaN, in head 0
+    const int64_t nan_iq = n_q > 1 ? 1 : 0; // query row that is set to NaN, in head 0
 
     float * q_data = (float *) malloc(DK * n_q  * n_head * sizeof(float));
     float * k_data = (float *) malloc(DK * n_kv * n_head * sizeof(float));
@@ -452,10 +452,32 @@ int main(void) {
         }
     }
 
+    // chunked decode with the q heads of one kv head grouped: group widths 1, 2, 4, 8 (Qwen3-30B-A3B),
+    // 16 (two groups per kv head) and 12 (uneven split), odd head sizes, every KV type and mask kind
+    for (ggml_type type : kv_types) {
+        for (int64_t gqa : { 1, 2, 4, 8, 12, 16 }) {
+            test_flash_attn(backend, 128, 128, 2*gqa, 2, 1030, 1, type, type, MASK_CAUSAL, 0.0f, 1.0f);
+        }
+        test_flash_attn(backend, 128, 128, 16, 2, 4101, 1, type, type, MASK_CAUSAL, 0.0f, 1.0f);
+        test_flash_attn(backend, 128, 128, 16, 2,  520, 1, type, type, MASK_NONE,   0.0f, 1.0f);
+        test_flash_attn(backend, 128, 128, 16, 2, 1030, 1, type, type, MASK_BLOCKS, 0.0f, 1.0f);
+        test_flash_attn(backend, 128, 128, 16, 2, 1030, 1, type, type, MASK_TAIL,   0.0f, 1.0f);
+        test_flash_attn(backend, 128, 128, 16, 2, 1030, 1, type, type, MASK_CAUSAL, 0.0f, 20.0f);
+        test_flash_attn(backend, 128, 128, 16, 2, 1030, 1, type, type, MASK_CAUSAL, 8.0f, 1.0f);
+    }
+    test_flash_attn(backend,  72,  72, 16, 2, 1030, 1, GGML_TYPE_F16,  GGML_TYPE_F16,  MASK_CAUSAL, 0.0f, 1.0f);
+    test_flash_attn(backend,  64,  40, 16, 2, 1030, 1, GGML_TYPE_F16,  GGML_TYPE_F16,  MASK_CAUSAL, 0.0f, 1.0f);
+    test_flash_attn(backend,  76,  64, 16, 2, 1030, 1, GGML_TYPE_F32,  GGML_TYPE_F32,  MASK_CAUSAL, 0.0f, 1.0f);
+    test_flash_attn(backend, 192, 128, 16, 2, 1030, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, MASK_CAUSAL, 0.0f, 1.0f);
+    test_flash_attn(backend, 128, 128, 16, 2, 1030, 1, GGML_TYPE_Q8_0, GGML_TYPE_F16,  MASK_CAUSAL, 0.0f, 1.0f);
+
     // NaN scores must not be dropped by the blocked running max of the per-row kernel
     // (F16/F32 K only: Q quantized to q8_0 for a quantized K does not keep NaN in a defined way)
     test_nan_propagation(backend, 64, 100, 3, GGML_TYPE_F16);
     test_nan_propagation(backend, 64, 100, 3, GGML_TYPE_F32);
+    // the same on the chunked decode path
+    test_nan_propagation(backend, 64, 1030, 1, GGML_TYPE_F16);
+    test_nan_propagation(backend, 64, 1030, 1, GGML_TYPE_F32);
 
     ggml_backend_free(backend);
 
