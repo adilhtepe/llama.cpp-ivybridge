@@ -501,9 +501,92 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 #endif
 }
 
-// placeholder implementation for Apple targets
-void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+
+    block_q8_K * GGML_RESTRICT y = vy;
+
+#if defined(__AVX2__) || defined(__AVX__)
+    // bit-exact with quantize_row_q8_K_ref: same max selection, same nearest_int() rounding, same int8 truncation
+    const __m256 signBit = _mm256_set1_ps(-0.0f);
+
+    for (int64_t i = 0; i < nb; i++) {
+        // max(abs(e)) for the block; NaN lanes are skipped like the scalar comparison
+        __m256 maxAbs = _mm256_setzero_ps();
+        for (int j = 0; j < QK_K; j += 8) {
+            maxAbs = _mm256_max_ps(_mm256_andnot_ps(signBit, _mm256_loadu_ps(x + j)), maxAbs);
+        }
+        __m128 max4 = _mm_max_ps(_mm256_extractf128_ps(maxAbs, 1), _mm256_castps256_ps128(maxAbs));
+        max4 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
+        max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
+        const float amax = _mm_cvtss_f32(max4);
+
+        if (!amax) {
+            y[i].d = 0;
+            memset(y[i].qs, 0, QK_K);
+            x += QK_K;
+            continue;
+        }
+
+        // the first element reaching amax decides the sign of the scale
+        float max = 0;
+        for (int j = 0; j < QK_K; j += 8) {
+            const __m256 ax = _mm256_andnot_ps(signBit, _mm256_loadu_ps(x + j));
+            int mask = _mm256_movemask_ps(_mm256_cmp_ps(ax, _mm256_set1_ps(amax), _CMP_EQ_OQ));
+            if (mask) {
+                int l = 0;
+                while (!(mask & 1)) {
+                    mask >>= 1;
+                    l++;
+                }
+                max = x[j + l];
+                break;
+            }
+        }
+
+        const float iscale = -127.f/max;
+        y[i].d = 1/iscale;
+
+        const __m256  vscale = _mm256_set1_ps(iscale);
+        const __m256  round  = _mm256_set1_ps(12582912.f); // nearest_int(): 1.5*2^23, the result is in the mantissa bits
+        const __m128i mmant  = _mm_set1_epi32(0x007fffff);
+        const __m128i mbias  = _mm_set1_epi32(0x00400000);
+        const __m128i m127   = _mm_set1_epi32(127);
+        const __m128i mbyte  = _mm_set1_epi32(0xff);
+        const __m128i m80    = _mm_set1_epi8((char) 0x80);
+        const __m128i zero   = _mm_setzero_si128();
+
+        for (int j = 0; j < QK_K; j += 16) {
+            const __m256i v0 = _mm256_castps_si256(_mm256_add_ps(_mm256_mul_ps(_mm256_loadu_ps(x + j    ), vscale), round));
+            const __m256i v1 = _mm256_castps_si256(_mm256_add_ps(_mm256_mul_ps(_mm256_loadu_ps(x + j + 8), vscale), round));
+
+            __m128i i0 = _mm256_castsi256_si128(v0);
+            __m128i i1 = _mm256_extractf128_si256(v0, 1);
+            __m128i i2 = _mm256_castsi256_si128(v1);
+            __m128i i3 = _mm256_extractf128_si256(v1, 1);
+
+            // (bits & 0x007fffff) - 0x00400000, MIN(127, v), then keep the low byte as the int8_t store does
+            i0 = _mm_and_si128(_mm_min_epi32(_mm_sub_epi32(_mm_and_si128(i0, mmant), mbias), m127), mbyte);
+            i1 = _mm_and_si128(_mm_min_epi32(_mm_sub_epi32(_mm_and_si128(i1, mmant), mbias), m127), mbyte);
+            i2 = _mm_and_si128(_mm_min_epi32(_mm_sub_epi32(_mm_and_si128(i2, mmant), mbias), m127), mbyte);
+            i3 = _mm_and_si128(_mm_min_epi32(_mm_sub_epi32(_mm_and_si128(i3, mmant), mbias), m127), mbyte);
+
+            const __m128i q = _mm_packus_epi16(_mm_packus_epi32(i0, i1), _mm_packus_epi32(i2, i3));
+            _mm_storeu_si128((__m128i *)(y[i].qs + j), q);
+
+            // sum of the 16 signed bytes: sum(q ^ 0x80) - 16*128
+            const __m128i s = _mm_sad_epu8(_mm_xor_si128(q, m80), zero);
+            y[i].bsums[j/16] = _mm_cvtsi128_si32(s) + _mm_extract_epi32(s, 2) - 16*128;
+        }
+
+        x += QK_K;
+    }
+#else
+    GGML_UNUSED(nb);
+    // scalar
     quantize_row_q8_K_ref(x, y, k);
+#endif
 }
 
 //===================================== Dot products =================================
