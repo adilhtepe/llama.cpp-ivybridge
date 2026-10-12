@@ -456,6 +456,15 @@ void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+#if defined(__AVX__)
+// 8 x int8 (low 64 bits of v) -> 8 x f32
+static inline __m256 cvt_i8x8_f32(const __m128i v) {
+    const __m128i lo = _mm_cvtepi8_epi32(v);
+    const __m128i hi = _mm_cvtepi8_epi32(_mm_srli_si128(v, 4));
+    return _mm256_cvtepi32_ps(_mm256_insertf128_si256(_mm256_castsi128_si256(lo), hi, 1));
+}
+#endif
+
 void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_0;
 
@@ -466,6 +475,21 @@ void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRI
     for (int i = 0; i < nb; i++) {
         const float d = GGML_FP16_TO_FP32(x[i].d);
 
+#if defined(__AVX__)
+        // same int -> float -> *d sequence as the scalar loop, so the results are identical
+        const __m256  vd = _mm256_set1_ps(d);
+        const __m128i m4 = _mm_set1_epi8(0x0F);
+        const __m128i m8 = _mm_set1_epi8(8);
+
+        const __m128i q  = _mm_loadu_si128((const __m128i *) x[i].qs);
+        const __m128i x0 = _mm_sub_epi8(_mm_and_si128(q, m4), m8);
+        const __m128i x1 = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(q, 4), m4), m8);
+
+        _mm256_storeu_ps(y + i*qk +  0, _mm256_mul_ps(cvt_i8x8_f32(x0), vd));
+        _mm256_storeu_ps(y + i*qk +  8, _mm256_mul_ps(cvt_i8x8_f32(_mm_srli_si128(x0, 8)), vd));
+        _mm256_storeu_ps(y + i*qk + 16, _mm256_mul_ps(cvt_i8x8_f32(x1), vd));
+        _mm256_storeu_ps(y + i*qk + 24, _mm256_mul_ps(cvt_i8x8_f32(_mm_srli_si128(x1, 8)), vd));
+#else
         for (int j = 0; j < qk/2; ++j) {
             const int x0 = (x[i].qs[j] & 0x0F) - 8;
             const int x1 = (x[i].qs[j] >>   4) - 8;
@@ -473,6 +497,7 @@ void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRI
             y[i*qk + j + 0   ] = x0*d;
             y[i*qk + j + qk/2] = x1*d;
         }
+#endif
     }
 }
 
@@ -560,9 +585,18 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
     for (int i = 0; i < nb; i++) {
         const float d = GGML_FP16_TO_FP32(x[i].d);
 
+#if defined(__AVX__)
+        const __m256 vd = _mm256_set1_ps(d);
+
+        for (int j = 0; j < qk; j += 8) {
+            const __m128i q = _mm_loadl_epi64((const __m128i *) (x[i].qs + j));
+            _mm256_storeu_ps(y + i*qk + j, _mm256_mul_ps(cvt_i8x8_f32(q), vd));
+        }
+#else
         for (int j = 0; j < qk; ++j) {
             y[i*qk + j] = x[i].qs[j]*d;
         }
+#endif
     }
 }
 
