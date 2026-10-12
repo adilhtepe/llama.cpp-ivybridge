@@ -89,7 +89,7 @@ inline static void ggml_vec_set_bf16(const int n, ggml_bf16_t * x, const ggml_bf
 
 inline static void ggml_vec_add_f32 (const int n, float * z, const float * x, const float * y) {
     int i = 0;
-#if defined(__AVX2__)
+#if defined(__AVX2__) || defined(__AVX__)
     for (; i + 7 < n; i += 8) {
         __m256 vx = _mm256_loadu_ps(x + i);
         __m256 vy = _mm256_loadu_ps(y + i);
