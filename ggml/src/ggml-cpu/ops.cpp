@@ -9944,26 +9944,6 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         // total rows in q
         const int64_t nr = neq1*neq2*neq3;
 
-        // disable for NUMA distribute
-        const bool disable_chunking = ggml_numa_static_chunking();
-
-        // 4x chunks per thread
-        int nth_scaled = nth * 4;
-        int64_t chunk_size = (nr + nth_scaled - 1) / nth_scaled;
-        int64_t nchunk     = (nr + chunk_size - 1) / chunk_size;
-
-        if (nth == 1 || nchunk < nth || disable_chunking) {
-            nchunk = nth;
-        }
-
-        if (ith == 0) {
-            ggml_threadpool_chunk_set(params->threadpool, nth);
-        }
-
-        ggml_barrier(params->threadpool);
-
-        const int64_t dr = (nr + nchunk - 1) / nchunk;
-
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
         bool use_tiled = !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
@@ -9977,16 +9957,50 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 #endif
         use_tiled &= (DV % f32_epr == 0);
 #endif
+
+        // the tiled path always computes whole Q_TILE_SZ-row tiles, so its work is split in tiles
+        // (a chunk boundary inside a tile would pad the cut rows up to a full tile); each head holds
+        // ceil(neq1/Q_TILE_SZ) tiles, the last one ragged when neq1 is not a multiple of the tile.
+        // the per-row path is split in rows.
+        const int64_t tiles_per_head = (neq1 + Q_TILE_SZ - 1) / Q_TILE_SZ;
+        const int64_t n_units = use_tiled ? tiles_per_head*neq2*neq3 : nr;
+
+        // disable for NUMA distribute
+        const bool disable_chunking = ggml_numa_static_chunking();
+
+        // 4x chunks per thread
+        int nth_scaled = nth * 4;
+        int64_t chunk_size = (n_units + nth_scaled - 1) / nth_scaled;
+        int64_t nchunk     = (n_units + chunk_size - 1) / chunk_size;
+
+        if (nth == 1 || nchunk < nth || disable_chunking) {
+            nchunk = nth;
+        }
+
+        if (ith == 0) {
+            ggml_threadpool_chunk_set(params->threadpool, nth);
+        }
+
+        ggml_barrier(params->threadpool);
+
+        const int64_t dr = (n_units + nchunk - 1) / nchunk;
+
         int current_chunk = ith;
 
         while (current_chunk < nchunk) {
-            const int64_t ir0 = dr * current_chunk;
-            const int64_t ir1 = MIN(ir0 + dr, nr);
+            const int64_t iu0 = dr * current_chunk;
+            const int64_t iu1 = MIN(iu0 + dr, n_units);
 
             if (use_tiled) {
-                ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
+                for (int64_t iu = iu0; iu < iu1; ++iu) {
+                    const int64_t head = iu / tiles_per_head;
+                    const int64_t iq1  = (iu % tiles_per_head)*Q_TILE_SZ;
+                    const int64_t ir0  = head*neq1 + iq1;
+                    const int64_t ir1  = ir0 + MIN(Q_TILE_SZ, neq1 - iq1);
+                    ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
+                }
             } else {
-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, iu0, iu1, 0, nek1, nullptr, 0);
             }
 
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
