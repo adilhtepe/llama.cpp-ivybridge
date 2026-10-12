@@ -2348,7 +2348,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
             const __m128i q8h_1 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
 
             // both 16-byte halves of a 32-element sub-block use the same scale, so the
-            // 16-bit pair sums are added first (each lane is at most 2*15*128 in magnitude)
+            // 16-bit pair sums are added first (each lane is at most 4*15*128 in magnitude)
             const __m128i p16l = _mm_add_epi16(_mm_maddubs_epi16(q4l_0, q8l_0), _mm_maddubs_epi16(q4l_1, q8l_1));
             const __m128i p16h = _mm_add_epi16(_mm_maddubs_epi16(q4h_0, q8h_0), _mm_maddubs_epi16(q4h_1, q8h_1));
             sumi_0 = _mm_add_epi32(sumi_0, _mm_madd_epi16(scale_l, p16l));

@@ -340,8 +340,9 @@ int main(int argc, char * argv[]) {
         printf("Testing %s\n", ggml_type_name(c.type));
 
         const int blck = ggml_get_type_traits(c.type)->blck_size;
-        // odd block counts cover the scalar tail of the legacy kernels
-        const int sizes[] = { blck, 3*blck, 4*blck, 8*blck, 2048, 4096 };
+        // block counts of 1..3 modulo 4 cover the two block loop and the scalar tail of the
+        // legacy kernels, both on their own and after the four block loop
+        const int sizes[] = { blck, 2*blck, 3*blck, 4*blck, 5*blck, 6*blck, 7*blck, 8*blck, 2048, 4096 };
 
         for (int rep = 0; rep < 8; rep++) {
             for (int n : sizes) {
