@@ -9002,9 +9002,16 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 smax = fmaxf(smax, s[j]);
             }
 
-            // the whole block is masked
+            // the whole block is masked; fmaxf drops NaN, so a block whose scores are all NaN
+            // also ends up here and must fall through so the NaN reaches the output
             if (smax == -INFINITY) {
-                continue;
+                bool has_nan = false;
+                for (int j = 0; j < nblk; ++j) {
+                    has_nan |= std::isnan(s[j]);
+                }
+                if (!has_nan) {
+                    continue;
+                }
             }
 
             if (smax > M) {

@@ -1528,6 +1528,9 @@ inline static __m256 ggml_v_expf_x8(__m256 x) {
                                       _mm256_andnot_ps(c, MADD256(k, j, k)))));
 }
 
+#undef MADD256
+#undef NMADD256
+
 #endif // __AVX__ && !(__AVX2__ && __FMA__)
 
 inline static void ggml_vec_silu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
