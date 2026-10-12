@@ -584,29 +584,34 @@ inline static void ggml_vec_mad_f16(const int n, ggml_fp16_t * GGML_RESTRICT y, 
 
 // y (f32) += x (f16) * v
 inline static void ggml_vec_mad_f16_f32(const int n, float * GGML_RESTRICT y, const ggml_fp16_t * GGML_RESTRICT x, const float v) {
+    int i = 0;
 #if defined(__AVX__) && defined(__F16C__)
-    const int np = (n & ~(GGML_F32_STEP - 1));
-
-    GGML_F32x8 vx = GGML_F32x8_SET1(v);
-
-    GGML_F32x8 ax[GGML_F32_ARR];
-    GGML_F32x8 ay[GGML_F32_ARR];
-
-    for (int i = 0; i < np; i += GGML_F32_STEP) {
-        for (int j = 0; j < GGML_F32_ARR; j++) {
-            ax[j] = GGML_F32Cx8_LOAD(x + i + j*GGML_F32_EPR);
-            ay[j] = GGML_F32x8_LOAD(y + i + j*GGML_F32_EPR);
-            ay[j] = GGML_F32x8_FMA(ay[j], ax[j], vx);
-
-            GGML_F32x8_STORE(y + i + j*GGML_F32_EPR, ay[j]);
+    // fixed 8-wide step independent of GGML_F32_STEP/EPR, which are 16-wide on AVX-512
+    const __m256 vv = _mm256_set1_ps(v);
+    for (; i + 32 <= n; i += 32) {
+        for (int j = 0; j < 4; j++) {
+            const __m256 ax = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i + j*8)));
+            const __m256 ay = _mm256_loadu_ps(y + i + j*8);
+#if defined(__FMA__)
+            _mm256_storeu_ps(y + i + j*8, _mm256_fmadd_ps(ax, vv, ay));
+#else
+            _mm256_storeu_ps(y + i + j*8, _mm256_add_ps(_mm256_mul_ps(ax, vv), ay));
+#endif
         }
     }
+    for (; i + 8 <= n; i += 8) {
+        const __m256 ax = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i)));
+        const __m256 ay = _mm256_loadu_ps(y + i);
+#if defined(__FMA__)
+        _mm256_storeu_ps(y + i, _mm256_fmadd_ps(ax, vv, ay));
 #else
-    const int np = 0;
+        _mm256_storeu_ps(y + i, _mm256_add_ps(_mm256_mul_ps(ax, vv), ay));
+#endif
+    }
 #endif
 
     // scalar and leftovers
-    for (int i = np; i < n; ++i) {
+    for (; i < n; ++i) {
         y[i] += GGML_CPU_FP16_TO_FP32(x[i])*v;
     }
 }

@@ -336,6 +336,9 @@ int main(void) {
     test_flash_attn(backend,  64,  64, 4, 2, 512,  1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, MASK_CAUSAL, 0.0f, 1.0f);
     test_flash_attn(backend,  64,  64, 4, 2, 512, 64, GGML_TYPE_Q4_0, GGML_TYPE_F16,  MASK_CAUSAL, 0.0f, 1.0f);
     test_flash_attn(backend,  72,  72, 4, 2, 513, 64, GGML_TYPE_F16,  GGML_TYPE_F16,  MASK_CAUSAL, 0.0f, 1.0f);
+    // per-row path with F16 V and DV not a multiple of 32/8: covers every tail of the f16->f32 mad
+    test_flash_attn(backend,  64,  76, 4, 2, 512,  3, GGML_TYPE_F16,  GGML_TYPE_F16,  MASK_CAUSAL, 0.0f, 1.0f);
+    test_flash_attn(backend,  64,  40, 4, 2, 511,  1, GGML_TYPE_F16,  GGML_TYPE_F16,  MASK_CAUSAL, 0.0f, 1.0f);
     test_flash_attn(backend, 192, 128, 4, 2, 513, 64, GGML_TYPE_F16,  GGML_TYPE_F16,  MASK_CAUSAL, 0.0f, 1.0f);
     test_flash_attn(backend, 192, 128, 4, 2, 513,  1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, MASK_CAUSAL, 0.0f, 1.0f);
 
