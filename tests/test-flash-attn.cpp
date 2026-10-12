@@ -81,7 +81,27 @@ static double nmse(const float * ref, const float * out, int64_t n, float * max_
 enum mask_kind {
     MASK_NONE,
     MASK_CAUSAL,
+    MASK_BLOCKS, // two of every three 32-position blocks fully masked: whole KV blocks skipped mid-sequence
+    MASK_TAIL,   // everything but the last 40 positions masked: blocks and decode chunks skipped before any max is set
 };
+
+static const char * mask_kind_name(enum mask_kind kind) {
+    switch (kind) {
+        case MASK_CAUSAL: return "causal";
+        case MASK_BLOCKS: return "blocks";
+        case MASK_TAIL:   return "tail";
+        default:          return "none";
+    }
+}
+
+static bool mask_is_masked(enum mask_kind kind, int64_t n_kv, int64_t n_q, int64_t iq, int64_t ik) {
+    switch (kind) {
+        case MASK_CAUSAL: return ik > n_kv - n_q + iq;
+        case MASK_BLOCKS: return (ik / 32) % 3 != 2;
+        case MASK_TAIL:   return ik < n_kv - 40;
+        default:          return false;
+    }
+}
 
 // q: [DK, n_q, n_head], k: [DK, n_kv, n_head_kv], v: [DV, n_kv, n_head_kv]
 static void test_flash_attn(ggml_backend_t backend, int64_t DK, int64_t DV, int64_t n_head, int64_t n_head_kv,
@@ -136,7 +156,7 @@ static void test_flash_attn(ggml_backend_t backend, int64_t DK, int64_t DV, int6
         ggml_fp16_t * m = (ggml_fp16_t *) malloc(n_kv * n_q * sizeof(ggml_fp16_t));
         for (int64_t iq = 0; iq < n_q; ++iq) {
             for (int64_t ik = 0; ik < n_kv; ++ik) {
-                const bool masked = mask_kind == MASK_CAUSAL && ik > n_kv - n_q + iq;
+                const bool masked = mask_is_masked(mask_kind, n_kv, n_q, iq, ik);
                 m[iq * n_kv + ik] = ggml_fp32_to_fp16(masked ? -INFINITY : 0.0f);
             }
         }
@@ -170,7 +190,7 @@ static void test_flash_attn(ggml_backend_t backend, int64_t DK, int64_t DV, int6
     printf("TEST fattn DK=%lld DV=%lld heads=%lld/%lld n_kv=%lld n_q=%lld K=%s V=%s mask=%s max_bias=%.1f q_range=%.0f (%s): %s "
            "(fast nmse: %.2e max_err: %.2e, vec nmse: %.2e max_err: %.2e, tol: %.0e)\n",
            (long long) DK, (long long) DV, (long long) n_head, (long long) n_head_kv, (long long) n_kv, (long long) n_q,
-           ggml_type_name(type_K), ggml_type_name(type_V), mask_kind == MASK_CAUSAL ? "causal" : "none", max_bias, q_range,
+           ggml_type_name(type_K), ggml_type_name(type_V), mask_kind_name(mask_kind), max_bias, q_range,
            path, ok ? "PASS" : "FAIL", err_fast, max_err_fast, err_ref, max_err_ref, tol);
 
     if (!ok) {
@@ -181,6 +201,86 @@ static void test_flash_attn(ggml_backend_t backend, int64_t DK, int64_t DV, int6
     ggml_free(ctx);
     free(q_data); free(k_data); free(v_data);
     free(out_fast); free(out_ref); free(ref_data);
+}
+
+// a NaN query row must give a NaN output row and leave the other rows finite. With a NaN Q every
+// score of every KV block is NaN, which the per-row kernel's running max would otherwise drop
+static void test_nan_propagation(ggml_backend_t backend, int64_t DK, int64_t n_kv, int64_t n_q, ggml_type type_KV) {
+    srand(0xBEEF);
+
+    const int64_t n_head = 2;
+    const int64_t nan_iq = 1; // query row that is set to NaN, in head 0
+
+    float * q_data = (float *) malloc(DK * n_q  * n_head * sizeof(float));
+    float * k_data = (float *) malloc(DK * n_kv * n_head * sizeof(float));
+    float * v_data = (float *) malloc(DK * n_kv * n_head * sizeof(float));
+    for (int64_t i = 0; i < DK * n_q  * n_head; ++i) q_data[i] = frand(-1.0f, 1.0f);
+    for (int64_t i = 0; i < DK * n_kv * n_head; ++i) k_data[i] = frand(-1.0f, 1.0f);
+    for (int64_t i = 0; i < DK * n_kv * n_head; ++i) v_data[i] = frand(-1.0f, 1.0f);
+    for (int64_t d = 0; d < DK; ++d) q_data[nan_iq * DK + d] = NAN;
+
+    struct ggml_init_params ip = { 16*1024*1024, NULL, true };
+    struct ggml_context * ctx = ggml_init(ip);
+
+    struct ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, DK, n_q,  n_head);
+    struct ggml_tensor * k = ggml_new_tensor_3d(ctx, type_KV,       DK, n_kv, n_head);
+    struct ggml_tensor * v = ggml_new_tensor_3d(ctx, type_KV,       DK, n_kv, n_head);
+    struct ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_q);
+
+    struct ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f / sqrtf((float) DK), 0.0f, 0.0f);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    fill_tensor(q, q_data, n_q  * n_head, DK);
+    fill_tensor(k, k_data, n_kv * n_head, DK);
+    fill_tensor(v, v_data, n_kv * n_head, DK);
+
+    ggml_fp16_t * m = (ggml_fp16_t *) malloc(n_kv * n_q * sizeof(ggml_fp16_t));
+    for (int64_t iq = 0; iq < n_q; ++iq) {
+        for (int64_t ik = 0; ik < n_kv; ++ik) {
+            m[iq * n_kv + ik] = ggml_fp32_to_fp16(mask_is_masked(MASK_CAUSAL, n_kv, n_q, iq, ik) ? -INFINITY : 0.0f);
+        }
+    }
+    ggml_backend_tensor_set(mask, m, 0, ggml_nbytes(mask));
+    free(m);
+
+    cpu_set_use_ref(backend, false);
+    ggml_backend_graph_compute(backend, gf);
+
+    // out: [DV, n_head, n_q]
+    float * o = (float *) malloc(ggml_nbytes(out));
+    ggml_backend_tensor_get(out, o, 0, ggml_nbytes(out));
+
+    int64_t n_nan_expected = 0, n_nan_unexpected = 0;
+    for (int64_t iq = 0; iq < n_q; ++iq) {
+        for (int64_t h = 0; h < n_head; ++h) {
+            for (int64_t d = 0; d < DK; ++d) {
+                const bool is_nan = isnan(o[(iq * n_head + h) * DK + d]);
+                if (iq == nan_iq && h == 0) {
+                    n_nan_expected += is_nan;
+                } else {
+                    n_nan_unexpected += is_nan;
+                }
+            }
+        }
+    }
+    const bool ok = n_nan_expected == DK && n_nan_unexpected == 0;
+
+    printf("TEST nan_propagation DK=%lld n_kv=%lld n_q=%lld KV=%s: %s (NaN in the NaN row: %lld/%lld, elsewhere: %lld)\n",
+           (long long) DK, (long long) n_kv, (long long) n_q, ggml_type_name(type_KV), ok ? "PASS" : "FAIL",
+           (long long) n_nan_expected, (long long) DK, (long long) n_nan_unexpected);
+
+    if (!ok) {
+        ++n_failed;
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    free(q_data); free(k_data); free(v_data); free(o);
 }
 
 // to_float of a q8_0/q4_0 row must give exactly (int) q * d, the scalar reference formula
@@ -341,6 +441,21 @@ int main(void) {
     test_flash_attn(backend,  64,  40, 4, 2, 511,  1, GGML_TYPE_F16,  GGML_TYPE_F16,  MASK_CAUSAL, 0.0f, 1.0f);
     test_flash_attn(backend, 192, 128, 4, 2, 513, 64, GGML_TYPE_F16,  GGML_TYPE_F16,  MASK_CAUSAL, 0.0f, 1.0f);
     test_flash_attn(backend, 192, 128, 4, 2, 513,  1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, MASK_CAUSAL, 0.0f, 1.0f);
+
+    // whole KV blocks masked: mid-sequence (blocks) and before any running max exists (tail), on the
+    // per-row path, the chunked decode path (with fully masked chunks) and the tiled path
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (enum mask_kind kind : { MASK_BLOCKS, MASK_TAIL }) {
+            test_flash_attn(backend, 64, 64, 4, 2,  200,  3, type, type, kind, 0.0f, 1.0f);
+            test_flash_attn(backend, 64, 64, 4, 2, 1030,  1, type, type, kind, 0.0f, 1.0f);
+            test_flash_attn(backend, 64, 64, 4, 2,  513, 64, type, type, kind, 0.0f, 1.0f);
+        }
+    }
+
+    // NaN scores must not be dropped by the blocked running max of the per-row kernel
+    // (F16/F32 K only: Q quantized to q8_0 for a quantized K does not keep NaN in a defined way)
+    test_nan_propagation(backend, 64, 100, 3, GGML_TYPE_F16);
+    test_nan_propagation(backend, 64, 100, 3, GGML_TYPE_F32);
 
     ggml_backend_free(backend);
 
