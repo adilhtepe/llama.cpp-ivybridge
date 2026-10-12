@@ -1281,6 +1281,62 @@ inline static __m256 ggml_v_silu(__m256 x) {
     return _mm256_div_ps(x, one_plus_exp_neg_x);
 }
 
+#elif defined(__AVX__)
+
+// no FMA and no 256-bit integer ops: multiply-add is split, the exponent manipulation is done on the 128-bit halves
+#define MADD256(x, y, z) _mm256_add_ps(_mm256_mul_ps(x, y), z)
+#define NMADD256(x, y, z) _mm256_sub_ps(z, _mm256_mul_ps(x, y))
+
+inline static __m256 ggml_v_set_m128i(__m128i lo, __m128i hi) {
+    return _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_castsi128_ps(lo)), _mm_castsi128_ps(hi), 1);
+}
+
+// adapted from arm limited optimized routine
+// the maximum error is 1.45358 plus 0.5 ulps
+// numbers above 88.38 will flush to infinity
+// numbers beneath -103.97 will flush to zero
+inline static __m256 ggml_v_expf(__m256 x) {
+    const __m256 r = _mm256_set1_ps(0x1.8p23f);
+    const __m256 z = MADD256(x, _mm256_set1_ps(0x1.715476p+0f), r);
+    const __m256 n = _mm256_sub_ps(z, r);
+    const __m256 b =
+        NMADD256(n, _mm256_set1_ps(0x1.7f7d1cp-20f), NMADD256(n, _mm256_set1_ps(0x1.62e4p-1f), x));
+    const __m128i el = _mm_slli_epi32(_mm_castps_si128(_mm256_castps256_ps128(z)), 23);
+    const __m128i eh = _mm_slli_epi32(_mm_castps_si128(_mm256_extractf128_ps(z, 1)), 23);
+    const __m128i one = _mm_castps_si128(_mm_set1_ps(1));
+    const __m256 k = ggml_v_set_m128i(_mm_add_epi32(el, one), _mm_add_epi32(eh, one));
+    const __m256 c = _mm256_cmp_ps(_mm256_andnot_ps(_mm256_set1_ps(-0.f), n), _mm256_set1_ps(126), _CMP_GT_OQ);
+    const __m256 u = _mm256_mul_ps(b, b);
+    const __m256 j =
+        MADD256(MADD256(MADD256(_mm256_set1_ps(0x1.0e4020p-7f), b, _mm256_set1_ps(0x1.573e2ep-5f)), u,
+                        MADD256(_mm256_set1_ps(0x1.555e66p-3f), b, _mm256_set1_ps(0x1.fffdb6p-2f))),
+                u, _mm256_mul_ps(_mm256_set1_ps(0x1.ffffecp-1f), b));
+    if (!_mm256_movemask_ps(c))
+        return MADD256(j, k, k);
+    const __m256 nle = _mm256_cmp_ps(n, _mm256_setzero_ps(), _CMP_LE_OQ);
+    const __m128i gl = _mm_and_si128(_mm_castps_si128(_mm256_castps256_ps128(nle)), _mm_set1_epi32(0x82000000u));
+    const __m128i gh = _mm_and_si128(_mm_castps_si128(_mm256_extractf128_ps(nle, 1)), _mm_set1_epi32(0x82000000u));
+    const __m256 s1 = ggml_v_set_m128i(_mm_add_epi32(gl, _mm_set1_epi32(0x7f000000u)),
+                                       _mm_add_epi32(gh, _mm_set1_epi32(0x7f000000u)));
+    const __m256 s2 = ggml_v_set_m128i(_mm_sub_epi32(el, gl), _mm_sub_epi32(eh, gh));
+    const __m256 d = _mm256_cmp_ps(_mm256_andnot_ps(_mm256_set1_ps(-0.f), n), _mm256_set1_ps(192), _CMP_GT_OQ);
+    return _mm256_or_ps(
+        _mm256_and_ps(d, _mm256_mul_ps(s1, s1)),
+        _mm256_andnot_ps(d,
+                         _mm256_or_ps(_mm256_and_ps(c, _mm256_mul_ps(MADD256(s2, j, s2), s1)),
+                                      _mm256_andnot_ps(c, MADD256(k, j, k)))));
+}
+
+// computes silu x/(1+exp(-x)) in single precision vector
+inline static __m256 ggml_v_silu(__m256 x) {
+    const __m256 one = _mm256_set1_ps(1);
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 neg_x = _mm256_sub_ps(zero, x);
+    const __m256 exp_neg_x = ggml_v_expf(neg_x);
+    const __m256 one_plus_exp_neg_x = _mm256_add_ps(one, exp_neg_x);
+    return _mm256_div_ps(x, one_plus_exp_neg_x);
+}
+
 #elif defined(__SSE2__) // __AVX2__ / __ARM_NEON
 
 #if defined(__FMA__)

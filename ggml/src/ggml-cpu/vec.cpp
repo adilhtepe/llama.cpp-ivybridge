@@ -383,7 +383,7 @@ void ggml_vec_silu_f32(const int n, float * y, const float * x) {
     for (; i + 15 < n; i += 16) {
         _mm512_storeu_ps(y + i, ggml_v_silu(_mm512_loadu_ps(x + i)));
     }
-#elif defined(__AVX2__) && defined(__FMA__)
+#elif defined(__AVX__)
     for (; i + 7 < n; i += 8) {
         _mm256_storeu_ps(y + i, ggml_v_silu(_mm256_loadu_ps(x + i)));
     }
@@ -420,7 +420,7 @@ void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float * 
     for (; i + 15 < n; i += 16) {
         _mm512_storeu_ps(y + i, _mm512_mul_ps(ggml_v_silu(_mm512_loadu_ps(x + i)), _mm512_loadu_ps(g + i)));
     }
-#elif defined(__AVX2__) && defined(__FMA__)
+#elif defined(__AVX__)
     for (; i + 7 < n; i += 8) {
         _mm256_storeu_ps(y + i, _mm256_mul_ps(ggml_v_silu(_mm256_loadu_ps(x + i)), _mm256_loadu_ps(g + i)));
     }
@@ -568,7 +568,7 @@ ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float 
         _mm512_storeu_ps(y + i, val);
         sum += (ggml_float)_mm512_reduce_add_ps(val);
     }
-#elif defined(__AVX2__) && defined(__FMA__)
+#elif defined(__AVX__)
     for (; i + 7 < n; i += 8) {
         __m256 val = ggml_v_expf(_mm256_sub_ps(_mm256_loadu_ps(x + i),
                                                _mm256_set1_ps(max)));

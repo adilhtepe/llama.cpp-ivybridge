@@ -93,6 +93,95 @@ static int test_acc(ggml_context * ctx, std::mt19937 & rng, int64_t ne0a, int64_
     return ok ? 0 : 1;
 }
 
+static double rel_err(float got, float ref, double floor) {
+    return fabs((double) got - (double) ref) / (fabs((double) ref) + floor);
+}
+
+static int test_silu(ggml_context * ctx, std::mt19937 & rng, int64_t ne0, bool glu, int n_threads) {
+    const int64_t ne1 = 4;
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
+    ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
+    float * xd = (float *) x->data;
+    float * gd = (float *) g->data;
+
+    std::normal_distribution<float> nrm(0.0f, 4.0f);
+    for (int64_t i = 0; i < ne0*ne1; i++) {
+        xd[i] = nrm(rng);
+        gd[i] = nrm(rng);
+    }
+    // values that make the exponential flush to zero or infinity
+    const float special[] = { -120.0f, -100.0f, -88.0f, -20.0f, -0.0f, 0.0f, 20.0f, 88.0f, 100.0f, 120.0f };
+    for (int64_t i = 0; i < std::min(ne0*ne1, (int64_t) (sizeof(special)/sizeof(special[0]))); i++) {
+        xd[i] = special[i];
+    }
+
+    ggml_tensor * y = glu ? ggml_swiglu_split(ctx, x, g) : ggml_silu(ctx, x);
+    graph_compute(ctx, y, n_threads);
+
+    const float * yd = (const float *) y->data;
+
+    double max_err = 0.0;
+    for (int64_t i = 0; i < ne0*ne1; i++) {
+        float ref = xd[i]/(1.0f + expf(-xd[i]));
+        if (glu) {
+            ref *= gd[i];
+        }
+        max_err = std::max(max_err, rel_err(yd[i], ref, 1e-7));
+    }
+
+    const bool ok = max_err <= 1e-5;
+    printf("  %s ne0=%5lld: max rel err %.3e %s\n", glu ? "SWIGLU" : "SILU  ", (long long) ne0, max_err, ok ? "OK" : "FAILED");
+    return ok ? 0 : 1;
+}
+
+static int test_soft_max(ggml_context * ctx, std::mt19937 & rng, int64_t ne0, int n_threads) {
+    const int64_t ne1 = 4;
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
+    float * xd = (float *) x->data;
+
+    std::normal_distribution<float> nrm(0.0f, 3.0f);
+    for (int64_t i = 0; i < ne0*ne1; i++) {
+        xd[i] = nrm(rng);
+    }
+    // masked entries in the second row
+    for (int64_t i0 = 0; i0 < ne0; i0 += 5) {
+        xd[ne0 + i0] = -INFINITY;
+    }
+    xd[ne0] = 1.0f;
+
+    ggml_tensor * y = ggml_soft_max(ctx, x);
+    graph_compute(ctx, y, n_threads);
+
+    const float * yd = (const float *) y->data;
+
+    double max_err = 0.0;
+    for (int64_t i1 = 0; i1 < ne1; i1++) {
+        const float * xr = xd + i1*ne0;
+        const float * yr = yd + i1*ne0;
+
+        float max = -INFINITY;
+        for (int64_t i0 = 0; i0 < ne0; i0++) {
+            max = std::max(max, xr[i0]);
+        }
+        std::vector<float> val(ne0);
+        double sum = 0.0;
+        for (int64_t i0 = 0; i0 < ne0; i0++) {
+            val[i0] = expf(xr[i0] - max);
+            sum += (double) val[i0];
+        }
+        const float scale = 1.0/sum;
+        for (int64_t i0 = 0; i0 < ne0; i0++) {
+            max_err = std::max(max_err, rel_err(yr[i0], val[i0]*scale, 1e-9));
+        }
+    }
+
+    const bool ok = max_err <= 1e-5;
+    printf("  SOFT_MAX ne0=%5lld: max rel err %.3e %s\n", (long long) ne0, max_err, ok ? "OK" : "FAILED");
+    return ok ? 0 : 1;
+}
+
 int main(int /*argc*/, const char ** /*argv*/) {
     ggml_cpu_init();
 
@@ -118,6 +207,14 @@ int main(int /*argc*/, const char ** /*argv*/) {
         for (int64_t ne0b : { 1, 7, 8, 9, 16, 29, 64, 1021 }) {
             ggml_context * ctx = ggml_init(params);
             n_failed += test_acc(ctx, rng, ne0b + 11, 6, ne0b, 4, 3, 1, n_threads);
+            ggml_free(ctx);
+        }
+
+        for (int64_t ne0 : { 1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 33, 100, 768, 1021 }) {
+            ggml_context * ctx = ggml_init(params);
+            n_failed += test_silu(ctx, rng, ne0, false, n_threads);
+            n_failed += test_silu(ctx, rng, ne0, true, n_threads);
+            n_failed += test_soft_max(ctx, rng, ne0, n_threads);
             ggml_free(ctx);
         }
     }
