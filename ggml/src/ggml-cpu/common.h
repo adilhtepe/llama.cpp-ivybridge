@@ -9,6 +9,17 @@
 #define GGML_FA_TILE_Q  64
 #define GGML_FA_TILE_KV 64
 
+// single-token decode: KV rows are processed in blocks of this many positions, and up to this many
+// q heads that share one kv head are processed together over each converted K/V row
+#define GGML_FA_DECODE_KV_BLK 32
+#define GGML_FA_DECODE_GQA    8
+
+// per-thread scratch (in floats) of the grouped decode kernel: Q rows, one K and V block converted to
+// F32 with rows padded to 8, the VKQ accumulators, the scores and weights, plus alignment slack
+#define GGML_FA_DECODE_SCRATCH_F32(DK, DV) \
+    (GGML_FA_DECODE_GQA*GGML_PAD(DK, 8) + GGML_FA_DECODE_KV_BLK*(GGML_PAD(DK, 8) + GGML_PAD(DV, 8)) + \
+     GGML_FA_DECODE_GQA*GGML_PAD(DV, 8) + 2*GGML_FA_DECODE_GQA*GGML_FA_DECODE_KV_BLK + 8)
+
 #ifdef __cplusplus
 
 #include <utility>

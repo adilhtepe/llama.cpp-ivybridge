@@ -8927,7 +8927,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
     // KV positions are processed in blocks: the scores of a block are computed first, the running
     // max is updated once per block and the softmax weights come from the vectorized expf
-    static constexpr int KV_BLK = 32;
+    static constexpr int KV_BLK = GGML_FA_DECODE_KV_BLK;
 
     int ith = params->ith;
 
@@ -9531,6 +9531,308 @@ static void ggml_flash_attn_ext_reduce_partials(
     }
 }
 
+// Single-token decode over one KV chunk for a group of q heads that share one kv head.
+//
+// The per-row kernel above converts every K and V row once per q head and keeps the V accumulator in
+// memory. With grouped-query attention the same kv head serves several q heads, so here each K/V row of
+// the chunk is converted to F32 once and the scores and value sums of all heads of the group are taken
+// from that copy: the conversion and the K/V traffic are paid once per group, and the hot loops are
+// plain F32 multiply-adds with one accumulator per head held in registers. Rows in the scratch are
+// zero-padded to a multiple of 8 so there are no tails to handle.
+//
+// Preconditions (checked by the caller): neq1 == 1, neq3 == 1, F32 Q, K and V convertible to F32 with
+// the same head count, the mask (if any) is shared by all heads, no ALiBi, no logit softcap, and
+// partials != nullptr.
+
+// scores of one K row against NG query rows: s[g*s_stride] = dot(kf, qf[g]) * scale + mv
+template <int NG>
+static void ggml_fa_decode_scores(
+        const float * GGML_RESTRICT qf,
+        const float * GGML_RESTRICT kf,
+        int64_t DKp, float scale, float mv,
+        float * GGML_RESTRICT s, int64_t s_stride) {
+#if defined(__AVX__)
+    __m256 acc[NG];
+    for (int g = 0; g < NG; ++g) {
+        acc[g] = _mm256_setzero_ps();
+    }
+    for (int64_t d = 0; d < DKp; d += 8) {
+        const __m256 kv = _mm256_load_ps(kf + d);
+        for (int g = 0; g < NG; ++g) {
+            acc[g] = _mm256_add_ps(acc[g], _mm256_mul_ps(kv, _mm256_load_ps(qf + g*DKp + d)));
+        }
+    }
+    for (int g = 0; g < NG; ++g) {
+        const __m128 t0 = _mm_add_ps(_mm256_castps256_ps128(acc[g]), _mm256_extractf128_ps(acc[g], 1));
+        const __m128 t1 = _mm_add_ps(t0, _mm_movehl_ps(t0, t0));
+        const __m128 t2 = _mm_add_ss(t1, _mm_shuffle_ps(t1, t1, 0x55));
+        s[g*s_stride] = _mm_cvtss_f32(t2)*scale + mv;
+    }
+#else
+    for (int g = 0; g < NG; ++g) {
+        ggml_float sum = 0.0;
+        for (int64_t d = 0; d < DKp; ++d) {
+            sum += (ggml_float) kf[d]*qf[g*DKp + d];
+        }
+        s[g*s_stride] = (float) sum*scale + mv;
+    }
+#endif
+}
+
+// vkq[g] += sum_j p[g*p_stride + j] * vf[j] over nrow converted V rows
+template <int NG>
+static void ggml_fa_decode_values(
+        float       * GGML_RESTRICT vkq,
+        const float * GGML_RESTRICT vf,
+        const float * GGML_RESTRICT p, int64_t p_stride,
+        int nrow, int64_t DVp) {
+#if defined(__AVX__)
+    for (int64_t d = 0; d < DVp; d += 8) {
+        __m256 acc[NG];
+        for (int g = 0; g < NG; ++g) {
+            acc[g] = _mm256_load_ps(vkq + g*DVp + d);
+        }
+        for (int j = 0; j < nrow; ++j) {
+            const __m256 vv = _mm256_load_ps(vf + j*DVp + d);
+            for (int g = 0; g < NG; ++g) {
+                acc[g] = _mm256_add_ps(acc[g], _mm256_mul_ps(vv, _mm256_broadcast_ss(p + g*p_stride + j)));
+            }
+        }
+        for (int g = 0; g < NG; ++g) {
+            _mm256_store_ps(vkq + g*DVp + d, acc[g]);
+        }
+    }
+#else
+    for (int g = 0; g < NG; ++g) {
+        for (int j = 0; j < nrow; ++j) {
+            const float pj = p[g*p_stride + j];
+            for (int64_t d = 0; d < DVp; ++d) {
+                vkq[g*DVp + d] += vf[j*DVp + d]*pj;
+            }
+        }
+    }
+#endif
+}
+
+static void ggml_compute_forward_flash_attn_ext_f16_decode_group(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        int64_t iq2_0, int ng,
+        int64_t ic_start, int64_t ic_end,
+        float * scratch,
+        float * partials, int64_t partial_stride) {
+    GGML_UNUSED(params);
+
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
+
+    static constexpr int KV_BLK = GGML_FA_DECODE_KV_BLK;
+    static constexpr int GQA    = GGML_FA_DECODE_GQA;
+
+    GGML_ASSERT(ng >= 1 && ng <= GQA);
+    GGML_ASSERT(partials != nullptr);
+
+    const int64_t DK  = nek0;
+    const int64_t DV  = nev0;
+    const int64_t DKp = GGML_PAD(DK, 8);
+    const int64_t DVp = GGML_PAD(DV, 8);
+
+    float scale = 1.0f;
+    memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
+
+    const int64_t ik2 = iq2_0 / (neq2/nek2);
+    const int64_t iv2 = iq2_0 / (neq2/nev2);
+
+    ggml_to_float_t const k_to_float = ggml_get_type_traits(k->type)->to_float;
+    ggml_to_float_t const v_to_float = ggml_get_type_traits(v->type)->to_float;
+
+    // 32-byte aligned scratch: Q rows, K block, V block, VKQ accumulators, scores, weights
+    float * qf  = (float *) (((uintptr_t) scratch + 31) & ~(uintptr_t) 31);
+    float * kf  = qf  + GQA*DKp;
+    float * vf  = kf  + KV_BLK*DKp;
+    float * vkq = vf  + KV_BLK*DVp;
+    float * s   = vkq + GQA*DVp;
+    float * p   = s   + GQA*KV_BLK;
+
+    // the padding columns are zeroed once and never written afterwards
+    memset(qf,  0, GQA*DKp*sizeof(float));
+    memset(kf,  0, KV_BLK*DKp*sizeof(float));
+    memset(vf,  0, KV_BLK*DVp*sizeof(float));
+    memset(vkq, 0, GQA*DVp*sizeof(float));
+
+    for (int g = 0; g < ng; ++g) {
+        const float * pq = (const float *) ((const char *) q->data + (iq2_0 + g)*nbq2);
+        memcpy(qf + g*DKp, pq, DK*sizeof(float));
+    }
+
+    float M[GQA];
+    float S[GQA];
+    for (int g = 0; g < GQA; ++g) {
+        M[g] = -INFINITY;
+        S[g] = 0.0f;
+    }
+
+    // iq1 == 0 and the mask is shared by all heads, so its first row applies
+    const ggml_fp16_t * mp = mask ? (const ggml_fp16_t *) mask->data : nullptr;
+
+    for (int64_t ic0 = ic_start; ic0 < ic_end; ic0 += KV_BLK) {
+        const int nblk = (int) std::min((int64_t) KV_BLK, ic_end - ic0);
+
+        // scores of the unmasked rows of the block for every head of the group
+        int act[KV_BLK];
+        int nact = 0;
+
+        for (int j = 0; j < nblk; ++j) {
+            const int64_t ic = ic0 + j;
+
+            const float mv = mp ? GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            if (mv == -INFINITY) {
+                for (int g = 0; g < ng; ++g) {
+                    s[g*KV_BLK + j] = -INFINITY;
+                }
+                continue;
+            }
+
+            const char * k_data = (const char *) k->data + (ic*nbk1 + ik2*nbk2);
+            float * krow = kf + j*DKp;
+            if (k->type == GGML_TYPE_F32) {
+                memcpy(krow, k_data, DK*sizeof(float));
+            } else if (k->type == GGML_TYPE_F16) {
+                ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) k_data, krow, DK);
+            } else {
+                k_to_float(k_data, krow, DK);
+            }
+
+            switch (ng) {
+                case 1: ggml_fa_decode_scores<1>(qf, krow, DKp, scale, mv, s + j, KV_BLK); break;
+                case 2: ggml_fa_decode_scores<2>(qf, krow, DKp, scale, mv, s + j, KV_BLK); break;
+                case 3: ggml_fa_decode_scores<3>(qf, krow, DKp, scale, mv, s + j, KV_BLK); break;
+                case 4: ggml_fa_decode_scores<4>(qf, krow, DKp, scale, mv, s + j, KV_BLK); break;
+                case 5: ggml_fa_decode_scores<5>(qf, krow, DKp, scale, mv, s + j, KV_BLK); break;
+                case 6: ggml_fa_decode_scores<6>(qf, krow, DKp, scale, mv, s + j, KV_BLK); break;
+                case 7: ggml_fa_decode_scores<7>(qf, krow, DKp, scale, mv, s + j, KV_BLK); break;
+                default: ggml_fa_decode_scores<8>(qf, krow, DKp, scale, mv, s + j, KV_BLK); break;
+            }
+
+            act[nact++] = j;
+        }
+
+        // online softmax per head: running max, rescale of the accumulator, weights of the block
+        bool any = false;
+
+        for (int g = 0; g < ng; ++g) {
+            float * sg = s + g*KV_BLK;
+            float * pg = p + g*KV_BLK;
+
+            float smax = -INFINITY;
+            for (int j = 0; j < nblk; ++j) {
+                smax = fmaxf(smax, sg[j]);
+            }
+
+            // the whole block is masked; fmaxf drops NaN, so a block whose scores are all NaN
+            // also ends up here and must fall through so the NaN reaches the output
+            if (smax == -INFINITY) {
+                bool has_nan = false;
+                for (int j = 0; j < nblk; ++j) {
+                    has_nan |= std::isnan(sg[j]);
+                }
+                if (!has_nan) {
+                    for (int j = 0; j < nblk; ++j) {
+                        pg[j] = 0.0f;
+                    }
+                    continue;
+                }
+            }
+
+            if (smax > M[g]) {
+                const float ms = expf(M[g] - smax);
+                M[g] = smax;
+                ggml_vec_scale_f32(DV, vkq + g*DVp, ms);
+                S[g] *= ms;
+            }
+
+            // p = expf(s - M), masked positions give 0
+            S[g] += (float) ggml_vec_soft_max_f32(nblk, pg, sg, M[g]);
+            any = true;
+        }
+
+        if (!any) {
+            continue;
+        }
+
+        // V rows of the unmasked positions, compacted, and their weights
+        for (int jj = 0; jj < nact; ++jj) {
+            const char * v_data = (const char *) v->data + ((ic0 + act[jj])*nbv1 + iv2*nbv2);
+            float * vrow = vf + jj*DVp;
+            if (v->type == GGML_TYPE_F32) {
+                memcpy(vrow, v_data, DV*sizeof(float));
+            } else if (v->type == GGML_TYPE_F16) {
+                ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) v_data, vrow, DV);
+            } else {
+                v_to_float(v_data, vrow, DV);
+            }
+        }
+        if (nact < nblk) {
+            // act[jj] >= jj, so the forward copy is safe in place
+            for (int g = 0; g < ng; ++g) {
+                float * pg = p + g*KV_BLK;
+                for (int jj = 0; jj < nact; ++jj) {
+                    pg[jj] = pg[act[jj]];
+                }
+            }
+        }
+
+        switch (ng) {
+            case 1: ggml_fa_decode_values<1>(vkq, vf, p, KV_BLK, nact, DVp); break;
+            case 2: ggml_fa_decode_values<2>(vkq, vf, p, KV_BLK, nact, DVp); break;
+            case 3: ggml_fa_decode_values<3>(vkq, vf, p, KV_BLK, nact, DVp); break;
+            case 4: ggml_fa_decode_values<4>(vkq, vf, p, KV_BLK, nact, DVp); break;
+            case 5: ggml_fa_decode_values<5>(vkq, vf, p, KV_BLK, nact, DVp); break;
+            case 6: ggml_fa_decode_values<6>(vkq, vf, p, KV_BLK, nact, DVp); break;
+            case 7: ggml_fa_decode_values<7>(vkq, vf, p, KV_BLK, nact, DVp); break;
+            default: ggml_fa_decode_values<8>(vkq, vf, p, KV_BLK, nact, DVp); break;
+        }
+    }
+
+    for (int g = 0; g < ng; ++g) {
+        float * vkqg = vkq + g*DVp;
+
+        // sinks - apply only on the first kv-chunk
+        if (sinks && ic_start == 0) {
+            const float sv = ((const float *) sinks->data)[iq2_0 + g];
+
+            float ms = 1.0f;
+            float vs = 1.0f;
+
+            if (sv > M[g]) {
+                ms = expf(M[g] - sv);
+                M[g] = sv;
+                ggml_vec_scale_f32(DV, vkqg, ms);
+            } else {
+                vs = expf(sv - M[g]);
+            }
+
+            S[g] = S[g]*ms + vs;
+        }
+
+        // partials layout: [M, S, VKQ[DV]] per query head
+        float * partial = partials + (iq2_0 + g)*partial_stride;
+        partial[0] = M[g];
+        partial[1] = S[g];
+        memcpy(partial + 2, vkqg, DV*sizeof(float));
+    }
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -9597,11 +9899,35 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t partial_stride = nth * partial_size;
         float *       chunk_partials = partials_base + ith * partial_size;
 
+        // the grouped kernel takes the q heads of one kv head together; it has no ALiBi or softcap
+        // and needs one mask row for all heads
+        float max_bias      = 0.0f;
+        float logit_softcap = 0.0f;
+        memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+        memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+        const ggml_tensor * mask = dst->src[3];
+        const bool use_grouped = nek2 == nev2 && max_bias == 0.0f && logit_softcap == 0.0f &&
+                                 (!mask || mask->ne[2] == 1);
+
         if (ic_start < nek1) {
-            for (int64_t q_head = 0; q_head < neq2; q_head++) {
-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(
-                    params, dst, q_head, q_head + 1, ic_start, ic_end,
-                    chunk_partials, partial_stride);
+            if (use_grouped) {
+                const int64_t rk2 = neq2/nek2;
+                float * scratch = partials_base + neq2*nth*partial_size + ith*GGML_FA_DECODE_SCRATCH_F32(DK, DV);
+
+                for (int64_t q_head = 0; q_head < neq2; ) {
+                    const int ng = (int) std::min<int64_t>(GGML_FA_DECODE_GQA, rk2 - q_head % rk2);
+                    ggml_compute_forward_flash_attn_ext_f16_decode_group(
+                        params, dst, q_head, ng, ic_start, ic_end,
+                        scratch, chunk_partials, partial_stride);
+                    q_head += ng;
+                }
+            } else {
+                for (int64_t q_head = 0; q_head < neq2; q_head++) {
+                    ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+                        params, dst, q_head, q_head + 1, ic_start, ic_end,
+                        chunk_partials, partial_stride);
+                }
             }
         } else {
             for (int64_t q_head = 0; q_head < neq2; q_head++) {
