@@ -58,7 +58,9 @@
 // Note: once we move threading into a separate C++ file
 // will use std::hardware_destructive_interference_size instead of hardcoding it here
 // and we'll use C++ attribute syntax.
-#define GGML_CACHE_LINE  64
+// Two 64-byte lines: the adjacent-line prefetcher on x86 cores pulls the neighbouring line
+// into L2, so counters padded to a single line still interfere with each other.
+#define GGML_CACHE_LINE  128
 
 #if defined(__clang__) || defined(__GNUC__)
 #define GGML_CACHE_ALIGN __attribute__((aligned(GGML_CACHE_LINE)))
@@ -205,6 +207,11 @@ typedef pthread_t ggml_thread_t;
 
 #define GGML_THREADPOOL_N_THREADS_MASK (0xffffU)
 #define GGML_THREADPOOL_N_THREADS_BITS (16)
+
+// spin iterations in ggml_barrier before yielding the cpu; the short budget is used when the pool
+// has more threads than cpus, otherwise the yield path is only reached behind long single-threaded nodes
+#define GGML_BARRIER_SPIN           (1u << 18)
+#define GGML_BARRIER_SPIN_THROTTLED (1u << 7)
 
 #if defined(__APPLE__)
 #include <unistd.h>
@@ -492,7 +499,8 @@ struct ggml_threadpool {
     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
 
     // these are atomic as an annotation for thread-sanitizer
-    atomic_bool stop;         // Used for stopping the threadpool altogether
+    // kept off the current_chunk line: abort is read by every thread on every node
+    atomic_bool GGML_CACHE_ALIGN stop; // Used for stopping the threadpool altogether
     atomic_bool pause;        // Used for pausing the threadpool or individual threads
     atomic_int  abort;        // Used for aborting processing of a graph
 
@@ -500,6 +508,7 @@ struct ggml_threadpool {
     int          n_threads;   // Number of threads in the pool
     int32_t      prio;        // Scheduling priority
     uint32_t     poll;        // Polling level (0 - no polling)
+    uint32_t     barrier_spin; // Spin budget of ggml_barrier before it yields
 
     enum ggml_status ec;
 };
@@ -579,9 +588,8 @@ void ggml_barrier(struct ggml_threadpool * tp) {
         return;
     }
 
-#ifdef GGML_USE_OPENMP
-    #pragma omp barrier
-#else
+    // Also used inside the OpenMP parallel region: the libgomp team barrier issues a futex wake
+    // syscall on every pass, which dominates graphs made of many small nodes.
     int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
 
     // enter barrier (full seq-cst fence)
@@ -596,9 +604,14 @@ void ggml_barrier(struct ggml_threadpool * tp) {
         return;
     }
 
-    // wait for other threads
-    while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
-        ggml_thread_cpu_relax();
+    // wait for other threads, give up the cpu once the spin budget is spent (preempted threads)
+    const uint32_t n_spin = tp->barrier_spin;
+    for (uint32_t i = 0; atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed; i++) {
+        if (i < n_spin) {
+            ggml_thread_cpu_relax();
+        } else {
+            sched_yield();
+        }
     }
 
     // exit barrier (full seq-cst fence)
@@ -608,7 +621,6 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     #else
     atomic_thread_fence(memory_order_seq_cst);
     #endif
-#endif
 }
 
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
@@ -724,6 +736,14 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
 bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
+}
+
+bool ggml_numa_static_chunking(void) {
+    // Static per-thread chunking keeps each thread on the same rows across graph evaluations, which is
+    // what makes first-touch page placement pay off when threads are pinned per node (distribute).
+    // With isolate or numactl the placement does not depend on which thread takes which chunk, so
+    // work-stealing is kept.
+    return ggml_is_numa() && g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_DISTRIBUTE;
 }
 
 #if defined(__ARM_ARCH)
@@ -1429,8 +1449,8 @@ UseGgmlGemm2:;
 
     // If the chunking is poor for the number of threads on this setup, scrap the whole plan.  Re-chunk it by thread.
     //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggml-org/llama.cpp/pull/6915
-    //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
-    if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
+    //   That holds for the distribute strategy (threads pinned per node, first-touch placement), see ggml_numa_static_chunking.
+    if (nchunk0 * nchunk1 < nth * 4 || ggml_numa_static_chunking()) {
         // distribute the thread work across the inner or outer loop based on which one is larger
         nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
         nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
@@ -1692,8 +1712,8 @@ static void ggml_compute_forward_mul_mat_id(
             chunk_size = 64;
         }
 
-        // disable for NUMA
-        const bool disable_chunking = ggml_is_numa();
+        // disable for NUMA distribute
+        const bool disable_chunking = ggml_numa_static_chunking();
 
         int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
         int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
@@ -2709,6 +2729,29 @@ static bool ggml_thread_apply_priority(int32_t prio) {
 
 #endif
 
+// cpus the process may run on, used to tell when a pool is oversubscribed
+static int ggml_thread_n_cpus_available(void) {
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (int) si.dwNumberOfProcessors;
+#else
+#if defined(__gnu_linux__)
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        return CPU_COUNT(&set);
+    }
+#endif
+#if defined(_SC_NPROCESSORS_ONLN)
+    const long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n > 0) {
+        return (int) n;
+    }
+#endif
+    return INT_MAX;
+#endif
+}
+
 static bool ggml_thread_cpumask_is_valid(const bool * mask) {
     for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
         if (mask[i]) { return true; }
@@ -3332,6 +3375,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->n_threads        = tpp->n_threads;
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
+        threadpool->barrier_spin     = GGML_BARRIER_SPIN;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
@@ -3415,6 +3459,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->abort            = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
+
+    threadpool->barrier_spin = n_threads > ggml_thread_n_cpus_available() ? GGML_BARRIER_SPIN_THROTTLED : GGML_BARRIER_SPIN;
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {

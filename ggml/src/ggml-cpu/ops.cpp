@@ -9618,8 +9618,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         // total rows in q
         const int64_t nr = neq1*neq2*neq3;
 
-        // disable for NUMA
-        const bool disable_chunking = ggml_is_numa();
+        // disable for NUMA distribute
+        const bool disable_chunking = ggml_numa_static_chunking();
 
         // 4x chunks per thread
         int nth_scaled = nth * 4;
@@ -11376,8 +11376,8 @@ static void ggml_compute_forward_gated_delta_net_f32(
     ggml_tensor * V = dst->src[2];
     int64_t nr = V->ne[1] * V->ne[3];
 
-    // disable for NUMA
-    const bool disable_chunking = ggml_is_numa();
+    // disable for NUMA distribute
+    const bool disable_chunking = ggml_numa_static_chunking();
 
     int nth = params->nth;
     int ith = params->ith;
