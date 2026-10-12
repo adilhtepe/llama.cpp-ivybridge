@@ -452,6 +452,36 @@ void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float * 
     }
 }
 
+ggml_float ggml_vec_sumsq_f32(const int n, const float * x) {
+    int i = 0;
+    ggml_float sum = 0;
+#if defined(__AVX__)
+    // squares are formed in f32 like the scalar loop, only the accumulation is widened to f64
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    __m256d acc2 = _mm256_setzero_pd();
+    __m256d acc3 = _mm256_setzero_pd();
+    for (; i + 15 < n; i += 16) {
+        const __m256 v0 = _mm256_loadu_ps(x + i);
+        const __m256 v1 = _mm256_loadu_ps(x + i + 8);
+        const __m256 s0 = _mm256_mul_ps(v0, v0);
+        const __m256 s1 = _mm256_mul_ps(v1, v1);
+        acc0 = _mm256_add_pd(acc0, _mm256_cvtps_pd(_mm256_castps256_ps128(s0)));
+        acc1 = _mm256_add_pd(acc1, _mm256_cvtps_pd(_mm256_extractf128_ps(s0, 1)));
+        acc2 = _mm256_add_pd(acc2, _mm256_cvtps_pd(_mm256_castps256_ps128(s1)));
+        acc3 = _mm256_add_pd(acc3, _mm256_cvtps_pd(_mm256_extractf128_ps(s1, 1)));
+    }
+    acc0 = _mm256_add_pd(_mm256_add_pd(acc0, acc1), _mm256_add_pd(acc2, acc3));
+    __m128d acc = _mm_add_pd(_mm256_castpd256_pd128(acc0), _mm256_extractf128_pd(acc0, 1));
+    acc = _mm_add_sd(acc, _mm_unpackhi_pd(acc, acc));
+    sum = _mm_cvtsd_f64(acc);
+#endif
+    for (; i < n; ++i) {
+        sum += (ggml_float)(x[i]*x[i]);
+    }
+    return sum;
+}
+
 ggml_float ggml_vec_cvar_f32(const int n, float * y, const float * x, const float mean) {
     int i = 0;
     ggml_float sum = 0;
