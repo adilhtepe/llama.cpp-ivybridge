@@ -506,6 +506,7 @@ struct ggml_threadpool {
 
     struct ggml_compute_state * workers;   // per thread state
     int          n_threads;   // Number of threads in the pool
+    int          n_cpus;      // Cpus the pool may run on, decides the barrier spin budget
     int32_t      prio;        // Scheduling priority
     uint32_t     poll;        // Polling level (0 - no polling)
     uint32_t     barrier_spin; // Spin budget of ggml_barrier before it yields
@@ -2759,6 +2760,20 @@ static bool ggml_thread_cpumask_is_valid(const bool * mask) {
     return false;
 }
 
+// cpus a pool with these params may run on: the cpumask when one is given, otherwise the affinity
+// of the creating thread. Evaluated before the pool pins any thread, so a strict placement that
+// leaves the calling thread on a single cpu does not make the pool look oversubscribed.
+static int ggml_threadpool_n_cpus(const struct ggml_threadpool_params * tpp) {
+    if (ggml_thread_cpumask_is_valid(tpp->cpumask)) {
+        int n = 0;
+        for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
+            n += tpp->cpumask[i] ? 1 : 0;
+        }
+        return n;
+    }
+    return ggml_thread_n_cpus_available();
+}
+
 static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask, bool strict, int32_t* iter) {
     if (!strict) {
         memcpy(local_mask, global_mask, GGML_MAX_N_THREADS);
@@ -3373,6 +3388,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->abort            = -1;
         threadpool->workers          = NULL;
         threadpool->n_threads        = tpp->n_threads;
+        threadpool->n_cpus           = ggml_threadpool_n_cpus(tpp);
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
         threadpool->barrier_spin     = GGML_BARRIER_SPIN;
@@ -3460,7 +3476,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
-    threadpool->barrier_spin = n_threads > ggml_thread_n_cpus_available() ? GGML_BARRIER_SPIN_THROTTLED : GGML_BARRIER_SPIN;
+    threadpool->barrier_spin = n_threads > threadpool->n_cpus ? GGML_BARRIER_SPIN_THROTTLED : GGML_BARRIER_SPIN;
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
