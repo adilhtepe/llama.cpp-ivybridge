@@ -80,6 +80,42 @@ static void tiled_run_microtile_scalar(const tiled_tile_src0 & src0, const tiled
     }
 }
 
+// Reference for the 32-element block formats: w = q0 - BIAS, each 32-block dot is exact in int32 and
+// scaled by the two float block scales
+template <int BIAS, int NK>
+static void tiled_run_microtile_q8_0_scalar(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                                            int i0, int j0, int num_k, int slab, float * buf, int buf_stride) {
+    constexpr int NB = TILED_TILE_K / 32;
+
+    const int nkr  = (NK > 0) ? NK : num_k;
+    const int seff = (NK > 0) ? 0 : slab;
+    const int qk_stride = nkr * TILED_TILE_K;
+    const int qk_off = seff * TILED_TILE_K;
+    const int nb_stride = NB * nkr;
+    const int nb_off = seff * NB;
+    const int bs_stride = (nkr == 1) ? TILED_TILE_ROWS : TILED_MICRO;
+    const int ds_off = seff * NB;
+
+    for (int i = 0; i < TILED_MICRO; i++) {
+        const int ar = i0 + i;
+        const uint8_t * q0 = &src0.q[ar * qk_stride + qk_off];
+        const float * d0s = &src0.dsub[ar * nb_stride + nb_off];
+        for (int j = 0; j < TILED_MICRO; j++) {
+            const int br = j0 + j;
+            const int8_t * q1 = &src1.q[br * qk_stride + qk_off];
+            float acc = 0.0f;
+            for (int s = 0; s < NB; s++) {
+                int32_t raw = 0;
+                for (int e = 0; e < 32; e++) {
+                    raw += ((int32_t) q0[s * 32 + e] - BIAS) * (int32_t) q1[s * 32 + e];
+                }
+                acc += (float) raw * (d0s[s] * src1.dsub[(ds_off + s) * bs_stride + br]);
+            }
+            buf[ar * buf_stride + br] += acc;
+        }
+    }
+}
+
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512DQ__)
 
 
@@ -501,6 +537,87 @@ static void tiled_run_microtile_avx(const tiled_tile_src0 & src0, const tiled_ti
 
 #endif // __AVX__ && !__AVX2__
 
+#if defined(__AVX__)
+
+// 128-bit kernel for the 32-element block formats (q8_0 activations), 4 src1 columns per group.
+// Each (row, column, 32-block) dot is one int32 vector, the 4 columns reduce with hadd into one
+// vector that is scaled by d0[s] * d1[s][cols] and accumulated in float.
+// BIAS < 128: the unsigned codes go straight into maddubs (2 * 31 * 127 per pair fits int16) and
+// BIAS * bsum is subtracted after the reduction, exact.
+// BIAS = 128 (q8_0, iq4_nl): |w| up to 127 overflows that, so the signed sign trick is used instead.
+template <int BIAS, int NK>
+static void tiled_run_microtile_q8_0_avx(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                                         int i0, int j0, int num_k, int slab, float * buf, int buf_stride) {
+    constexpr int NB = TILED_TILE_K / 32;
+    constexpr int GROUP = 4;
+
+    const int nkr  = (NK > 0) ? NK : num_k;
+    const int seff = (NK > 0) ? 0 : slab;
+    const int qk_stride = nkr * TILED_TILE_K;
+    const int qk_off = seff * TILED_TILE_K;
+    const int nb_stride = NB * nkr;
+    const int nb_off = seff * NB;
+    const int bs_stride = (nkr == 1) ? TILED_TILE_ROWS : TILED_MICRO;
+    const int bs_off = seff * TILED_MICRO; // per-16 bsums
+    const int ds_off = seff * NB;          // per-32 scales
+
+    const __m128i ones = _mm_set1_epi16(1);
+
+    for (int i = 0; i < TILED_MICRO; i++) {
+        const int ar = i0 + i;
+        const uint8_t * q0 = &src0.q[ar * qk_stride + qk_off];
+        const float * d0s = &src0.dsub[ar * nb_stride + nb_off];
+
+        for (int g = 0; g < TILED_MICRO; g += GROUP) {
+            const int8_t * q1g[GROUP];
+            for (int t = 0; t < GROUP; t++) {
+                q1g[t] = &src1.q[(j0 + g + t) * qk_stride + qk_off];
+            }
+            __m128 facc = _mm_setzero_ps();
+
+            for (int s = 0; s < NB; s++) {
+                const __m128i a0 = _mm_loadu_si128((const __m128i *) &q0[s * 32]);
+                const __m128i a1 = _mm_loadu_si128((const __m128i *) &q0[s * 32 + 16]);
+                __m128i acc[GROUP];
+                if constexpr (BIAS == 128) {
+                    const __m128i w0  = _mm_xor_si128(a0, _mm_set1_epi8((int8_t) 0x80)); // biased code -> signed int8
+                    const __m128i w1  = _mm_xor_si128(a1, _mm_set1_epi8((int8_t) 0x80));
+                    const __m128i ax0 = _mm_sign_epi8(w0, w0);
+                    const __m128i ax1 = _mm_sign_epi8(w1, w1);
+                    for (int t = 0; t < GROUP; t++) {
+                        const __m128i b0 = _mm_loadu_si128((const __m128i *) &q1g[t][s * 32]);
+                        const __m128i b1 = _mm_loadu_si128((const __m128i *) &q1g[t][s * 32 + 16]);
+                        acc[t] = _mm_add_epi32(_mm_madd_epi16(ones, _mm_maddubs_epi16(ax0, _mm_sign_epi8(b0, w0))),
+                                               _mm_madd_epi16(ones, _mm_maddubs_epi16(ax1, _mm_sign_epi8(b1, w1))));
+                    }
+                } else {
+                    for (int t = 0; t < GROUP; t++) {
+                        const __m128i b0 = _mm_loadu_si128((const __m128i *) &q1g[t][s * 32]);
+                        const __m128i b1 = _mm_loadu_si128((const __m128i *) &q1g[t][s * 32 + 16]);
+                        acc[t] = _mm_madd_epi16(ones, _mm_add_epi16(_mm_maddubs_epi16(a0, b0), _mm_maddubs_epi16(a1, b1)));
+                    }
+                }
+
+                // lane t = the 32-block dot of column g + t
+                __m128i sum = _mm_hadd_epi32(_mm_hadd_epi32(acc[0], acc[1]), _mm_hadd_epi32(acc[2], acc[3]));
+                if constexpr (BIAS != 128) {
+                    const __m128i bsum = _mm_add_epi32(
+                        _mm_loadu_si128((const __m128i *) &src1.bsums[(bs_off + 2 * s) * bs_stride + j0 + g]),
+                        _mm_loadu_si128((const __m128i *) &src1.bsums[(bs_off + 2 * s + 1) * bs_stride + j0 + g]));
+                    sum = _mm_sub_epi32(sum, _mm_mullo_epi32(bsum, _mm_set1_epi32(BIAS)));
+                }
+                const __m128 d = _mm_mul_ps(_mm_set1_ps(d0s[s]), _mm_loadu_ps(&src1.dsub[(ds_off + s) * bs_stride + j0 + g]));
+                facc = _mm_add_ps(facc, _mm_mul_ps(_mm_cvtepi32_ps(sum), d));
+            }
+
+            float * p = &buf[ar * buf_stride + j0 + g];
+            _mm_storeu_ps(p, _mm_add_ps(_mm_loadu_ps(p), facc));
+        }
+    }
+}
+
+#endif // __AVX__
+
 // main microtile entry point. num_k = K-blocks per row (the narrow path reads num_k slabs at row
 // stride num_k*256 so each weight row is one long stream); slab = this call's slab. num_k=1,
 // slab=0 is the standard single-slab path.
@@ -561,6 +678,36 @@ template void tiled_run_microtile<16, false, 4, true>(const tiled_tile_src0 & sr
 // q2_K: BIAS = 0
 template void tiled_run_microtile<16, true, 0, false>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                                                int i0, int j0, int num_k, int slab, float * buf, int buf_stride);
+
+// 32-element block formats: only the 128-bit kernel exists, it serves every AVX level
+template <int BIAS>
+void tiled_run_microtile_q8_0(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                              int i0, int j0, int num_k, int slab, float * buf, int buf_stride) {
+    const bool standard = (num_k == 1);
+#if defined(__AVX__)
+    if (standard) {
+        tiled_run_microtile_q8_0_avx<BIAS, 1>(src0, src1, i0, j0, num_k, slab, buf, buf_stride);
+    } else {
+        tiled_run_microtile_q8_0_avx<BIAS, 0>(src0, src1, i0, j0, num_k, slab, buf, buf_stride);
+    }
+#else
+    if (standard) {
+        tiled_run_microtile_q8_0_scalar<BIAS, 1>(src0, src1, i0, j0, num_k, slab, buf, buf_stride);
+    } else {
+        tiled_run_microtile_q8_0_scalar<BIAS, 0>(src0, src1, i0, j0, num_k, slab, buf, buf_stride);
+    }
+#endif
+}
+
+// q4_0
+template void tiled_run_microtile_q8_0<8>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                                          int i0, int j0, int num_k, int slab, float * buf, int buf_stride);
+// q5_0, mxfp4
+template void tiled_run_microtile_q8_0<16>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                                           int i0, int j0, int num_k, int slab, float * buf, int buf_stride);
+// q8_0, iq4_nl: sign trick
+template void tiled_run_microtile_q8_0<128>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                                            int i0, int j0, int num_k, int slab, float * buf, int buf_stride);
 
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))

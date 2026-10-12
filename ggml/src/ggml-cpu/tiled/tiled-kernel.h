@@ -8,14 +8,16 @@
 // tiled_repack_src1: Optional repack/recalculation of src1, per microtile-band
 // bit unpacking routines: tiled_unpk_nib4, tiled_unpk_2bit, tiled_unpk_or
 // LUT value expansion routines: tiled_lut8, tiled_unpk_sign32, tiled_unpk_tern8
+// 32-element block (q8_0 activation) routines: tiled_run_microtile_q8_0, tiled_unpk_nib4_16, tiled_unpk_qh32, tiled_sum_i8_16
 
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
-#if defined(__AVX2__)
+#if defined(__AVX__)
 #include <immintrin.h>
 #endif
 
@@ -35,9 +37,11 @@ struct tiled_tile_src0 {
     float    dmin[TILED_TILE_ROWS]; // dmin from each input block (if applicable), widened to F32
     int32_t   scales[TILED_TILE_ROWS * NB_MAX];  // per-subblock scale, stored as int32_t
     int32_t   mins[TILED_TILE_ROWS * NB_MAX];    // per-subblock min, used when HAS_MIN
+    // 32-element block formats (q4_0 family): the float scale of each 32-block, [row][block]; d/scales/mins unused
+    alignas(64) float dsub[TILED_TILE_ROWS * (TILED_TILE_K / 32)];
 };
 
-// src1 tile: built from q8_K (wdata)
+// src1 tile: built from q8_K (wdata), or from q8_0 for the 32-element block formats
 struct tiled_tile_src1 {
     // q8 codes, one byte per element. Note for VNNI these are reshaped + transposed to be suitable for dpbusd.
     alignas(64) int8_t  q[TILED_TILE_ROWS * TILED_TILE_K];
@@ -45,6 +49,8 @@ struct tiled_tile_src1 {
     alignas(64) int32_t bsums[(TILED_TILE_K / 16) * TILED_TILE_ROWS];
     // f32 (not f16): q8_k stores fp16, the unpack converts once
     float       d[TILED_TILE_ROWS];
+    // q8_0 activations: the float scale of each 32-block, laid out like bsums ([block][row]); d unused
+    alignas(64) float dsub[(TILED_TILE_K / 32) * TILED_TILE_ROWS];
 };
 
 // per-thread workspace: all tiled state lives here, allocated in wdata (one slot per thread)
@@ -87,15 +93,6 @@ inline void tiled_unpk_or(uint8_t * dst, const uint8_t * src) {
 
 // Unpacking kernels for IQ quants
 
-// LUT value expansion for the LUT-based formats (iq4_xs, iq grids): the bit unpackers
-// above give the indices, these expand 8/16 of them to widened codes in one pass
-// 16-entry byte LUT: dst[j] = lut[src[j]] (16 bytes)
-inline void tiled_lut8(const uint8_t * lut, const uint8_t * src, uint8_t * dst) {
-    _mm_storeu_si128((__m128i *) dst, _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *) lut),
-                                                       _mm_loadu_si128((const __m128i *) src)));
-}
-
-
 // 32 grid magnitudes (4 x 64-bit groups g0..g3, 8 values each) + 4 sign bytes
 // (byte l signs values 8*l .. 8*l+7) -> codes stored as (value + 128)
 inline void tiled_unpk_sign32(uint64_t g0, uint64_t g1, uint64_t g2, uint64_t g3,
@@ -115,11 +112,43 @@ inline void tiled_unpk_sign32(uint64_t g0, uint64_t g1, uint64_t g2, uint64_t g3
     const __m256i sgn  = _mm256_sub_epi8(_mm256_xor_si256(v, mask), mask);
     _mm256_storeu_si256((__m256i *) dst32, _mm256_add_epi8(sgn, _mm256_set1_epi8((int8_t) 128)));
 }
-// 8 ternary grid bytes (0 = 0, 1 = +1, 0xFF = -1): dst[j] = 128 + delta + 8 * (int8_t) src[j]
-inline void tiled_unpk_tern8(const uint8_t * src, int8_t delta, uint8_t * dst) {
-    const __m128i v = _mm_cvtepi8_epi16(_mm_loadl_epi64((const __m128i *) src));
-    const __m128i p = _mm_add_epi16(_mm_slli_epi16(v, 3), _mm_set1_epi16(128 + (int) delta));
-    _mm_storel_epi64((__m128i *) dst, _mm_packus_epi16(p, _mm_setzero_si128()));
+#elif defined(__AVX__)
+
+// 128-bit (SSSE3) definitions for AVX without AVX2: same bit handling as above, two 16-byte halves
+
+inline void tiled_unpk_nib4(const uint8_t * src, uint8_t * lo, uint8_t * hi) {
+    for (int h = 0; h < 2; h++) {
+        const __m128i v = _mm_loadu_si128((const __m128i *) (src + 16 * h));
+        _mm_storeu_si128((__m128i *) (lo + 16 * h), _mm_and_si128(v, _mm_set1_epi8(0x0F)));
+        _mm_storeu_si128((__m128i *) (hi + 16 * h), _mm_srli_epi16(_mm_and_si128(v, _mm_set1_epi8((int8_t) 0xF0)), 4));
+    }
+}
+template <int S> inline void tiled_unpk_2bit(const uint8_t * src, uint8_t * dst) {
+    for (int h = 0; h < 2; h++) {
+        _mm_storeu_si128((__m128i *) (dst + 16 * h), _mm_and_si128(
+            _mm_srli_epi16(_mm_loadu_si128((const __m128i *) (src + 16 * h)), S), _mm_set1_epi8(0x03)));
+    }
+}
+template <int S, int D, int M>
+inline void tiled_unpk_or(uint8_t * dst, const uint8_t * src) {
+    for (int h = 0; h < 2; h++) {
+        const __m128i v = _mm_slli_epi16(_mm_and_si128(
+            _mm_srli_epi16(_mm_loadu_si128((const __m128i *) (src + 16 * h)), S), _mm_set1_epi8((uint8_t) M)), D);
+        _mm_storeu_si128((__m128i *) (dst + 16 * h), _mm_or_si128(_mm_loadu_si128((const __m128i *) (dst + 16 * h)), v));
+    }
+}
+inline void tiled_unpk_sign32(uint64_t g0, uint64_t g1, uint64_t g2, uint64_t g3,
+                              const uint8_t signs[4], uint8_t * dst32) {
+    const uint64_t g[4] = { g0, g1, g2, g3 };
+    const __m128i s32 = _mm_set1_epi32((int32_t) (signs[0] | signs[1] << 8 | signs[2] << 16 | signs[3] << 24));
+    const __m128i sel = _mm_set1_epi64x((int64_t) 0x8040201008040201ULL);
+    for (int h = 0; h < 2; h++) {
+        const __m128i v    = _mm_set_epi64x((int64_t) g[2 * h + 1], (int64_t) g[2 * h]);
+        const __m128i sv   = _mm_shuffle_epi8(s32, _mm_set_epi64x(0x0101010101010101LL * (2 * h + 1), 0x0101010101010101LL * (2 * h)));
+        const __m128i mask = _mm_cmpeq_epi8(_mm_and_si128(sv, sel), sel);
+        const __m128i sgn  = _mm_sub_epi8(_mm_xor_si128(v, mask), mask);
+        _mm_storeu_si128((__m128i *) (dst32 + 16 * h), _mm_add_epi8(sgn, _mm_set1_epi8((int8_t) 128)));
+    }
 }
 #else
 
@@ -137,9 +166,6 @@ template <int S, int D, int M>
 inline void tiled_unpk_or(uint8_t * dst, const uint8_t * src) {
     for (int l = 0; l < 32; l++) { dst[l] = (uint8_t) (dst[l] | (((src[l] >> S) & M) << D)); }
 }
-inline void tiled_lut8(const uint8_t * lut, const uint8_t * src, uint8_t * dst) {
-    for (int j = 0; j < 16; j++) { dst[j] = lut[src[j]]; }
-}
 inline void tiled_unpk_sign32(uint64_t g0, uint64_t g1, uint64_t g2, uint64_t g3,
                               const uint8_t signs[4], uint8_t * dst32) {
     const uint64_t g[4] = { g0, g1, g2, g3 };
@@ -151,9 +177,68 @@ inline void tiled_unpk_sign32(uint64_t g0, uint64_t g1, uint64_t g2, uint64_t g3
         }
     }
 }
+#endif
+
+// 128-bit helpers, shared by AVX and AVX2
+#if defined(__AVX__)
+// LUT value expansion for the LUT-based formats (iq4_xs, iq grids): the bit unpackers
+// above give the indices, these expand 8/16 of them to widened codes in one pass
+// 16-entry byte LUT: dst[j] = lut[src[j]] (16 bytes)
+inline void tiled_lut8(const uint8_t * lut, const uint8_t * src, uint8_t * dst) {
+    _mm_storeu_si128((__m128i *) dst, _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *) lut),
+                                                       _mm_loadu_si128((const __m128i *) src)));
+}
+// 8 ternary grid bytes (0 = 0, 1 = +1, 0xFF = -1): dst[j] = 128 + delta + 8 * (int8_t) src[j]
+inline void tiled_unpk_tern8(const uint8_t * src, int8_t delta, uint8_t * dst) {
+    const __m128i v = _mm_cvtepi8_epi16(_mm_loadl_epi64((const __m128i *) src));
+    const __m128i p = _mm_add_epi16(_mm_slli_epi16(v, 3), _mm_set1_epi16(128 + (int) delta));
+    _mm_storel_epi64((__m128i *) dst, _mm_packus_epi16(p, _mm_setzero_si128()));
+}
+// 32-element block formats: 16 packed nibbles -> 16 low + 16 high codes
+inline void tiled_unpk_nib4_16(const uint8_t * src, uint8_t * lo, uint8_t * hi) {
+    const __m128i v = _mm_loadu_si128((const __m128i *) src);
+    _mm_storeu_si128((__m128i *) lo, _mm_and_si128(v, _mm_set1_epi8(0x0F)));
+    _mm_storeu_si128((__m128i *) hi, _mm_srli_epi16(_mm_and_si128(v, _mm_set1_epi8((int8_t) 0xF0)), 4));
+}
+// q5_0 high bits: OR bit j of the 32-bit qh into bit 4 of dst[j]
+inline void tiled_unpk_qh32(const uint8_t * qh, uint8_t * dst) {
+    uint32_t x32;
+    memcpy(&x32, qh, sizeof(x32));
+    const __m128i bits = _mm_set1_epi32((int32_t) x32);
+    const __m128i sel  = _mm_set1_epi64x((int64_t) 0x8040201008040201ULL);
+    for (int h = 0; h < 2; h++) {
+        const __m128i b = _mm_shuffle_epi8(bits, _mm_set_epi64x(0x0101010101010101LL * (2 * h + 1), 0x0101010101010101LL * (2 * h)));
+        const __m128i v = _mm_and_si128(_mm_cmpeq_epi8(_mm_and_si128(b, sel), sel), _mm_set1_epi8(0x10));
+        _mm_storeu_si128((__m128i *) (dst + 16 * h), _mm_or_si128(_mm_loadu_si128((const __m128i *) (dst + 16 * h)), v));
+    }
+}
+// sum of 16 signed bytes (the q8_0 per-16 code sum)
+inline int32_t tiled_sum_i8_16(const int8_t * src) {
+    // sad against zero of the +128 biased bytes, minus the bias
+    const __m128i v = _mm_xor_si128(_mm_loadu_si128((const __m128i *) src), _mm_set1_epi8((int8_t) 0x80));
+    const __m128i s = _mm_sad_epu8(v, _mm_setzero_si128());
+    return _mm_cvtsi128_si32(s) + _mm_extract_epi32(s, 2) - 16 * 128;
+}
+#else
+inline void tiled_lut8(const uint8_t * lut, const uint8_t * src, uint8_t * dst) {
+    for (int j = 0; j < 16; j++) { dst[j] = lut[src[j]]; }
+}
 // 8 ternary grid bytes (0 = 0, 1 = +1, 0xFF = -1): dst[j] = 128 + delta + 8 * (int8_t) src[j]
 inline void tiled_unpk_tern8(const uint8_t * src, int8_t delta, uint8_t * dst) {
     for (int j = 0; j < 8; j++) { dst[j] = (uint8_t) (128 + (int) delta + 8 * (int8_t) src[j]); }
+}
+inline void tiled_unpk_nib4_16(const uint8_t * src, uint8_t * lo, uint8_t * hi) {
+    for (int l = 0; l < 16; l++) { lo[l] = (uint8_t) (src[l] & 0xF); hi[l] = (uint8_t) (src[l] >> 4); }
+}
+inline void tiled_unpk_qh32(const uint8_t * qh, uint8_t * dst) {
+    uint32_t x32;
+    memcpy(&x32, qh, sizeof(x32));
+    for (int j = 0; j < 32; j++) { dst[j] = (uint8_t) (dst[j] | (((x32 >> j) & 1) << 4)); }
+}
+inline int32_t tiled_sum_i8_16(const int8_t * src) {
+    int32_t s = 0;
+    for (int j = 0; j < 16; j++) { s += src[j]; }
+    return s;
 }
 #endif
 
@@ -167,6 +252,13 @@ inline void tiled_unpk_tern8(const uint8_t * src, int8_t delta, uint8_t * dst) {
 template <int SUBBLK, bool HAS_MIN, int BIAS, bool ACTBIAS>
 void tiled_run_microtile(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                          int i0, int j0, int num_k, int slab, float * buf, int buf_stride);
+
+// Same microtile for the 32-element block formats (q4_0 family) with q8_0 activations: both sides
+// carry one float scale per 32 (dsub), so each 32-block dot is scaled in float. BIAS is the code
+// offset (w = q - BIAS); BIAS = 128 means |w| up to 127 (q8_0, iq4_nl).
+template <int BIAS>
+void tiled_run_microtile_q8_0(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                              int i0, int j0, int num_k, int slab, float * buf, int buf_stride);
 
 // Optional repack, if profitable for the kernel.
 // Repacks one 16-row band of src1 codes, called by driver as we reach each 16-row band in outer loop

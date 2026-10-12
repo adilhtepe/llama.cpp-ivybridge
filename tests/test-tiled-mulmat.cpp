@@ -694,8 +694,17 @@ int main(int argc, char ** argv) {
     test_matmul(backend, 256, 512, 256, GGML_TYPE_IQ3_S);
     test_matmul(backend, 256, 512, 256, GGML_TYPE_IQ1_S);
     test_matmul(backend, 256, 512, 256, GGML_TYPE_IQ1_M);
+    // 32-element block formats (q8_0 activations), K only needs to be a multiple of 32
+    test_matmul(backend, 256, 512, 256, GGML_TYPE_Q4_0);
+    test_matmul(backend, 256, 512, 256, GGML_TYPE_Q5_0);
+    test_matmul(backend, 256, 512, 256, GGML_TYPE_Q8_0);
+    test_matmul(backend, 256, 512, 256, GGML_TYPE_IQ4_NL);
+    test_matmul(backend, 256, 512, 256, GGML_TYPE_MXFP4);
+    test_matmul(backend,  64, 1408,  64, GGML_TYPE_Q4_0);                 // ragged K (5.5 slabs)
     test_mul_mat_id(backend,  256,  256,   2, 8, 1,  64, GGML_TYPE_Q4_K);  // single block, cne1 = 256
     test_mul_mat_id(backend,  512,  300,   4, 2, 1, 150, GGML_TYPE_IQ2_XXS); // iq type, imatrix quant
+    test_mul_mat_id(backend,  256,  256,   2, 8, 1,  64, GGML_TYPE_Q4_0);
+    test_mul_mat_id(backend, 1408,  128,   4, 2, 1, 150, GGML_TYPE_Q8_0);  // ragged K, cne1 = 75
 
     if (run_fuzz) {
         printf("Running fuzz tests.\n");
@@ -785,6 +794,28 @@ int main(int argc, char ** argv) {
         test_mul_mat_id(backend, 1024,  256,   2, 1, 1,  16, GGML_TYPE_Q4_K);  // cne1 = 8
         test_mul_mat_id(backend,  512,  128,   2, 3, 1,   8, GGML_TYPE_Q5_K);  // cne1 = 12
 
+        // 32-element block formats: ragged K (the last slab is zero-padded), K below one slab,
+        // narrow path, multi-window and strided src1
+        test_matmul(backend, 357, 1024, 137, GGML_TYPE_Q4_0);     // ragged M and K
+        test_matmul(backend, 357, 1408, 137, GGML_TYPE_Q5_0);     // ragged N, 5.5 slabs
+        test_matmul(backend, 256, 8192, 256, GGML_TYPE_Q8_0);     // long N
+        test_matmul(backend, 17, 2880, 257, GGML_TYPE_MXFP4);     // ragged N, 11.25 slabs
+        test_matmul(backend, 8, 1408, 8, GGML_TYPE_IQ4_NL);       // narrow path, ragged N
+        test_matmul(backend, 16, 32, 16, GGML_TYPE_Q4_0);         // N = 1 block
+        test_matmul(backend, 8, 128, 8, GGML_TYPE_Q8_0);          // N below one slab, narrow path
+        test_matmul(backend, 255, 1024, 255, GGML_TYPE_IQ4_NL);   // M and K one short of a tile
+        test_matmul(backend, 257, 1024, 257, GGML_TYPE_Q5_0);     // M and K one past a tile
+        test_mul_mat_id(backend,  512,  300,   4, 2, 1, 150, GGML_TYPE_Q4_0);   // ragged R, cne1 = 75
+        test_mul_mat_id(backend, 1408,  256,   4, 2, 2, 150, GGML_TYPE_Q5_0);   // ragged K, i11-diverse gather
+        test_mul_mat_id(backend, 2880,  256,   4, 2, 1, 100, GGML_TYPE_MXFP4);  // ragged K, cne1 = 50
+        test_mul_mat_id(backend, 1024,  256,   2, 2, 1,  16, GGML_TYPE_Q8_0);   // narrow path, cne1 = 16
+        test_mul_mat_id(backend, 1408,  256,   2, 1, 1,  16, GGML_TYPE_IQ4_NL); // narrow path, ragged K, cne1 = 8
+        test_mul_mat_id(backend,  768,  300,   8, 8, 1, 300, GGML_TYPE_Q4_0);   // 2 windows, ragged R and cne1
+        test_mul_mat_id(backend,  512,  256,   8, 8, 1, 128, GGML_TYPE_Q4_0, true); // strided src1
+        test_mul_mat_id(backend,  512,   65,   4, 2, 1, 128, GGML_TYPE_Q8_0);   // 1-row tail group
+        test_matmul_highdim(backend, 1024, 1024, 1024, 2, 1, 1, 1, GGML_TYPE_Q4_0); // broadcast r2=2
+        test_matmul_highdim(backend,  512, 1024,  512, 2, 2, 2, 2, GGML_TYPE_Q8_0); // 4D
+
         // higher-dim (ne[2], ne[3] > 1)
         // equal-batch and broadcast shapes (src1_2=2*src0_2, src1_3=2*src0_3)
         test_matmul_highdim(backend, 1024, 1024, 1024, 2, 1, 2, 1, GGML_TYPE_Q4_K); // 3D, tiled
@@ -805,7 +836,8 @@ int main(int argc, char ** argv) {
         printf("Starting benchmark runs.\n");
         const ggml_type bench_types[] = { GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                                           GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
-                                          GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M };
+                                          GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
+                                          GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4 };
         const size_t n_types = sizeof(bench_types) / sizeof(bench_types[0]);
 
         struct { int64_t M, N, K; } shapes[] = {
