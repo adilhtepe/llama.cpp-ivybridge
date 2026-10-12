@@ -12245,9 +12245,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // Qwen3-30B-A3B-shaped attention (32 q heads over 4 kv heads, head size 128) at long KV:
-    // single-token decode (nb=1) and the prompt tile width (nb=32) with f16 and q8_0 caches
+    // single-token decode (nb=1), a small batch on the per-row path (nb=32), one query tile (nb=64)
+    // and a full prompt ubatch (nb=512) on the tiled path, with f16 and q8_0 caches
     for (int64_t kv : {4096, 8192}) {
-        for (int64_t nb : {1, 32}) {
+        for (int64_t nb : {1, 32, 64, 512}) {
             for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
                 test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
             }
