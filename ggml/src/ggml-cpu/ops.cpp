@@ -9557,7 +9557,6 @@ static void ggml_fa_decode_scores(
         const float * GGML_RESTRICT kf,
         int64_t DKp, float scale, float mv,
         float * GGML_RESTRICT s, int64_t s_stride) {
-#if defined(__AVX__)
     __m256 acc[NG];
     for (int g = 0; g < NG; ++g) {
         acc[g] = _mm256_setzero_ps();
@@ -9574,15 +9573,6 @@ static void ggml_fa_decode_scores(
         const __m128 t2 = _mm_add_ss(t1, _mm_shuffle_ps(t1, t1, 0x55));
         s[g*s_stride] = _mm_cvtss_f32(t2)*scale + mv;
     }
-#else
-    for (int g = 0; g < NG; ++g) {
-        ggml_float sum = 0.0;
-        for (int64_t d = 0; d < DKp; ++d) {
-            sum += (ggml_float) kf[d]*qf[g*DKp + d];
-        }
-        s[g*s_stride] = (float) sum*scale + mv;
-    }
-#endif
 }
 
 // vkq[g] += sum_j p[g*p_stride + j] * vf[j] over nrow converted V rows
@@ -9592,7 +9582,6 @@ static void ggml_fa_decode_values(
         const float * GGML_RESTRICT vf,
         const float * GGML_RESTRICT p, int64_t p_stride,
         int nrow, int64_t DVp) {
-#if defined(__AVX__)
     for (int64_t d = 0; d < DVp; d += 8) {
         __m256 acc[NG];
         for (int g = 0; g < NG; ++g) {
@@ -9608,16 +9597,34 @@ static void ggml_fa_decode_values(
             _mm256_store_ps(vkq + g*DVp + d, acc[g]);
         }
     }
-#else
-    for (int g = 0; g < NG; ++g) {
+}
+
+// the same with the product of row j and head g masked out where pm[g*p_stride + j] is zero (all bits
+// set elsewhere): a zero weight must not touch its row, since 0 * inf is NaN. The and runs on a port the
+// multiply and add leave free, so the loop costs the same as the unmasked one
+template <int NG>
+static void ggml_fa_decode_values_masked(
+        float       * GGML_RESTRICT vkq,
+        const float * GGML_RESTRICT vf,
+        const float * GGML_RESTRICT p,
+        const float * GGML_RESTRICT pm, int64_t p_stride,
+        int nrow, int64_t DVp) {
+    for (int64_t d = 0; d < DVp; d += 8) {
+        __m256 acc[NG];
+        for (int g = 0; g < NG; ++g) {
+            acc[g] = _mm256_load_ps(vkq + g*DVp + d);
+        }
         for (int j = 0; j < nrow; ++j) {
-            const float pj = p[g*p_stride + j];
-            for (int64_t d = 0; d < DVp; ++d) {
-                vkq[g*DVp + d] += vf[j*DVp + d]*pj;
+            const __m256 vv = _mm256_load_ps(vf + j*DVp + d);
+            for (int g = 0; g < NG; ++g) {
+                const __m256 prod = _mm256_mul_ps(vv, _mm256_broadcast_ss(p + g*p_stride + j));
+                acc[g] = _mm256_add_ps(acc[g], _mm256_and_ps(prod, _mm256_broadcast_ss(pm + g*p_stride + j)));
             }
         }
+        for (int g = 0; g < NG; ++g) {
+            _mm256_store_ps(vkq + g*DVp + d, acc[g]);
+        }
     }
-#endif
 }
 
 static void ggml_compute_forward_flash_attn_ext_f16_decode_group(
@@ -9662,19 +9669,22 @@ static void ggml_compute_forward_flash_attn_ext_f16_decode_group(
     ggml_to_float_t const k_to_float = ggml_get_type_traits(k->type)->to_float;
     ggml_to_float_t const v_to_float = ggml_get_type_traits(v->type)->to_float;
 
-    // 32-byte aligned scratch: Q rows, K block, V block, VKQ accumulators, scores, weights
+    // 32-byte aligned scratch: Q rows, K block, V block, VKQ accumulators, scores, weights, weight masks
     float * qf  = (float *) (((uintptr_t) scratch + 31) & ~(uintptr_t) 31);
     float * kf  = qf  + GQA*DKp;
     float * vf  = kf  + KV_BLK*DKp;
     float * vkq = vf  + KV_BLK*DVp;
     float * s   = vkq + GQA*DVp;
     float * p   = s   + GQA*KV_BLK;
+    float * pm  = p   + GQA*KV_BLK;
 
-    // the padding columns are zeroed once and never written afterwards
+    // the padding columns are zeroed once and never written afterwards; the weights past the rows of
+    // a short block are read (and masked out) by the row classification below
     memset(qf,  0, GQA*DKp*sizeof(float));
     memset(kf,  0, KV_BLK*DKp*sizeof(float));
     memset(vf,  0, KV_BLK*DVp*sizeof(float));
     memset(vkq, 0, GQA*DVp*sizeof(float));
+    memset(p,   0, GQA*KV_BLK*sizeof(float));
 
     for (int g = 0; g < ng; ++g) {
         const float * pq = (const float *) ((const char *) q->data + (iq2_0 + g)*nbq2);
@@ -9772,50 +9782,35 @@ static void ggml_compute_forward_flash_attn_ext_f16_decode_group(
         }
 
         // A zero weight must not touch its V row (0 * inf would be NaN), as in the per-row kernel.
-        // Rows with a non-zero weight in every head of the group are compacted and taken by the
-        // grouped kernel; a row whose weight is zero in some heads only (underflow of expf) is
-        // added per head, skipping the zero weights; masked rows and rows with zero weight in every
-        // head are skipped. A NaN weight counts as non-zero so it reaches the output
-        int act[KV_BLK];
-        int part[KV_BLK];
-        int nact = 0;
-        int npart = 0;
-
-        for (int j = 0; j < nblk; ++j) {
-            int nnz = 0;
-            for (int g = 0; g < ng; ++g) {
-                nnz += p[g*KV_BLK + j] != 0.0f;
+        // Bit j of nz_any/nz_all is set when some/every head of the group has a non-zero weight for
+        // row j (a NaN weight counts as non-zero so it reaches the output). Rows with no weight at
+        // all (masked, or underflow of expf in every head) are left out; when some head has a zero
+        // weight for a row the others take, the products of the block go through the weight mask
+        const uint32_t rows   = nblk < 32 ? (1u << nblk) - 1 : 0xFFFFFFFFu;
+        uint32_t      nz_any  = 0;
+        uint32_t      nz_all  = rows;
+        const __m256  zero    = _mm256_setzero_ps();
+        for (int g = 0; g < ng; ++g) {
+            const float * pg = p + g*KV_BLK;
+            uint32_t nz = 0;
+            for (int j = 0; j < KV_BLK; j += 8) {
+                nz |= (uint32_t) _mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(pg + j), zero, _CMP_NEQ_UQ)) << j;
             }
-            if (nnz == ng) {
-                act[nact++] = j;
-            } else if (nnz > 0) {
-                part[npart++] = j;
-            }
+            nz_any |= nz;
+            nz_all &= nz;
         }
+        nz_any &= rows;
 
-        // the partial rows first, through the last scratch row (nact < KV_BLK when npart > 0), while
-        // their weights are still in place
-        for (int jj = 0; jj < npart; ++jj) {
-            const int j = part[jj];
-            const char * v_data = (const char *) v->data + ((ic0 + j)*nbv1 + iv2*nbv2);
-            float * vrow = vf + (KV_BLK - 1)*DVp;
-            if (v->type == GGML_TYPE_F32) {
-                memcpy(vrow, v_data, DV*sizeof(float));
-            } else if (v->type == GGML_TYPE_F16) {
-                ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) v_data, vrow, DV);
-            } else {
-                v_to_float(v_data, vrow, DV);
-            }
-            for (int g = 0; g < ng; ++g) {
-                const float pj = p[g*KV_BLK + j];
-                if (pj != 0.0f) {
-                    ggml_vec_mad_f32(DV, vkq + g*DVp, vrow, pj);
-                }
-            }
-        }
-
-        if (nact == 0) {
+        if (nz_any == 0) {
             continue;
+        }
+
+        int act[KV_BLK];
+        int nact = 0;
+        for (int j = 0; j < nblk; ++j) {
+            if (nz_any & (1u << j)) {
+                act[nact++] = j;
+            }
         }
 
         // V rows of the compacted positions and their weights
@@ -9840,15 +9835,36 @@ static void ggml_compute_forward_flash_attn_ext_f16_decode_group(
             }
         }
 
-        switch (ng) {
-            case 1: ggml_fa_decode_values<1>(vkq, vf, p, KV_BLK, nact, DVp); break;
-            case 2: ggml_fa_decode_values<2>(vkq, vf, p, KV_BLK, nact, DVp); break;
-            case 3: ggml_fa_decode_values<3>(vkq, vf, p, KV_BLK, nact, DVp); break;
-            case 4: ggml_fa_decode_values<4>(vkq, vf, p, KV_BLK, nact, DVp); break;
-            case 5: ggml_fa_decode_values<5>(vkq, vf, p, KV_BLK, nact, DVp); break;
-            case 6: ggml_fa_decode_values<6>(vkq, vf, p, KV_BLK, nact, DVp); break;
-            case 7: ggml_fa_decode_values<7>(vkq, vf, p, KV_BLK, nact, DVp); break;
-            default: ggml_fa_decode_values<8>(vkq, vf, p, KV_BLK, nact, DVp); break;
+        if (nz_all == nz_any) {
+            switch (ng) {
+                case 1: ggml_fa_decode_values<1>(vkq, vf, p, KV_BLK, nact, DVp); break;
+                case 2: ggml_fa_decode_values<2>(vkq, vf, p, KV_BLK, nact, DVp); break;
+                case 3: ggml_fa_decode_values<3>(vkq, vf, p, KV_BLK, nact, DVp); break;
+                case 4: ggml_fa_decode_values<4>(vkq, vf, p, KV_BLK, nact, DVp); break;
+                case 5: ggml_fa_decode_values<5>(vkq, vf, p, KV_BLK, nact, DVp); break;
+                case 6: ggml_fa_decode_values<6>(vkq, vf, p, KV_BLK, nact, DVp); break;
+                case 7: ggml_fa_decode_values<7>(vkq, vf, p, KV_BLK, nact, DVp); break;
+                default: ggml_fa_decode_values<8>(vkq, vf, p, KV_BLK, nact, DVp); break;
+            }
+        } else {
+            // weight masks of the compacted rows: all bits set where the weight is non-zero
+            for (int g = 0; g < ng; ++g) {
+                const float * pg  = p  + g*KV_BLK;
+                float       * pmg = pm + g*KV_BLK;
+                for (int j = 0; j < nact; j += 8) {
+                    _mm256_storeu_ps(pmg + j, _mm256_cmp_ps(_mm256_loadu_ps(pg + j), zero, _CMP_NEQ_UQ));
+                }
+            }
+            switch (ng) {
+                case 1: ggml_fa_decode_values_masked<1>(vkq, vf, p, pm, KV_BLK, nact, DVp); break;
+                case 2: ggml_fa_decode_values_masked<2>(vkq, vf, p, pm, KV_BLK, nact, DVp); break;
+                case 3: ggml_fa_decode_values_masked<3>(vkq, vf, p, pm, KV_BLK, nact, DVp); break;
+                case 4: ggml_fa_decode_values_masked<4>(vkq, vf, p, pm, KV_BLK, nact, DVp); break;
+                case 5: ggml_fa_decode_values_masked<5>(vkq, vf, p, pm, KV_BLK, nact, DVp); break;
+                case 6: ggml_fa_decode_values_masked<6>(vkq, vf, p, pm, KV_BLK, nact, DVp); break;
+                case 7: ggml_fa_decode_values_masked<7>(vkq, vf, p, pm, KV_BLK, nact, DVp); break;
+                default: ggml_fa_decode_values_masked<8>(vkq, vf, p, pm, KV_BLK, nact, DVp); break;
+            }
         }
     }
 
