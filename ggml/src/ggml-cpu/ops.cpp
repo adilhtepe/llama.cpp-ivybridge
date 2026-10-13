@@ -9533,6 +9533,9 @@ static void ggml_flash_attn_ext_reduce_partials(
 
 // Single-token decode over one KV chunk for a group of q heads that share one kv head.
 //
+// Only built where its hot loops are vectorized (AVX): the scalar fallbacks below are slower than
+// the per-row kernel's vec_dot and vec_mad, so other targets keep the per-row kernel.
+//
 // The per-row kernel above converts every K and V row once per q head and keeps the V accumulator in
 // memory. With grouped-query attention the same kv head serves several q heads, so here each K/V row of
 // the chunk is converted to F32 once and the scores and value sums of all heads of the group are taken
@@ -9543,6 +9546,9 @@ static void ggml_flash_attn_ext_reduce_partials(
 // Preconditions (checked by the caller): neq1 == 1, neq3 == 1, F32 Q, K and V convertible to F32 with
 // the same head count, the mask (if any) is shared by all heads, no ALiBi, no logit softcap, and
 // partials != nullptr.
+
+#if defined(__AVX__)
+#define GGML_FA_DECODE_GROUPED
 
 // scores of one K row against NG query rows: s[g*s_stride] = dot(kf, qf[g]) * scale + mv
 template <int NG>
@@ -9875,6 +9881,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_decode_group(
     }
 }
 
+#endif // __AVX__
+
 static void ggml_compute_forward_flash_attn_ext_f16(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -9941,18 +9949,21 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t partial_stride = nth * partial_size;
         float *       chunk_partials = partials_base + ith * partial_size;
 
-        // the grouped kernel takes the q heads of one kv head together; it has no ALiBi or softcap
-        // and needs one mask row for all heads
-        float max_bias      = 0.0f;
-        float logit_softcap = 0.0f;
-        memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
-        memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
-
-        const ggml_tensor * mask = dst->src[3];
-        const bool use_grouped = nek2 == nev2 && max_bias == 0.0f && logit_softcap == 0.0f &&
-                                 (!mask || mask->ne[2] == 1);
-
         if (ic_start < nek1) {
+            bool done = false;
+#if defined(GGML_FA_DECODE_GROUPED)
+            // the grouped kernel takes the q heads of one kv head together; it has no ALiBi or
+            // softcap and needs one mask row for all heads. Without grouped-query attention there
+            // is nothing to share and its K/V copies cost more than they save
+            float max_bias      = 0.0f;
+            float logit_softcap = 0.0f;
+            memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+            memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+            const ggml_tensor * mask = dst->src[3];
+            const bool use_grouped = neq2 > nek2 && nek2 == nev2 && max_bias == 0.0f && logit_softcap == 0.0f &&
+                                     (!mask || mask->ne[2] == 1);
+
             if (use_grouped) {
                 const int64_t rk2 = neq2/nek2;
                 float * scratch = partials_base + neq2*nth*partial_size + ith*GGML_FA_DECODE_SCRATCH_F32(DK, DV);
@@ -9964,7 +9975,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                         scratch, chunk_partials, partial_stride);
                     q_head += ng;
                 }
-            } else {
+                done = true;
+            }
+#endif
+            if (!done) {
                 for (int64_t q_head = 0; q_head < neq2; q_head++) {
                     ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                         params, dst, q_head, q_head + 1, ic_start, ic_end,
