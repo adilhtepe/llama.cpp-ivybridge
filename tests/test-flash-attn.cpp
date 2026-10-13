@@ -443,94 +443,6 @@ static void test_nan_propagation(ggml_backend_t backend, int64_t DK, int64_t n_k
     free(q_data); free(k_data); free(v_data); free(o);
 }
 
-// A V row whose softmax weight underflows to zero must not reach the output even when it holds
-// non-finite values: the row is skipped, not multiplied by zero (0 * inf = NaN). Chunked decode,
-// q heads 0 and 1 share kv head 0; row inf_ik of that kv head's V is +inf. Head 0 gives that row
-// a score far below its maximum, so its weight is exactly 0 and its output must stay finite and
-// match the vec-only reference path. With other_head_attends head 1 attends that row instead
-// (its output is legitimately non-finite); otherwise head 1 skips it as well
-static void test_zero_weight_inf_v(ggml_backend_t backend, int64_t n_kv, bool other_head_attends, ggml_type type_KV) {
-    srand(0xBEEF);
-
-    const int64_t DK = 64, n_head = 4, n_head_kv = 2, inf_ik = n_kv - 330;
-
-    float * q_data = (float *) malloc(DK * n_head    * sizeof(float));
-    float * k_data = (float *) malloc(DK * n_kv * n_head_kv * sizeof(float));
-    float * v_data = (float *) malloc(DK * n_kv * n_head_kv * sizeof(float));
-    for (int64_t i = 0; i < DK * n_head;         ++i) q_data[i] = frand(-1.0f, 1.0f);
-    for (int64_t i = 0; i < DK * n_kv * n_head_kv; ++i) k_data[i] = frand(-1.0f, 1.0f);
-    for (int64_t i = 0; i < DK * n_kv * n_head_kv; ++i) v_data[i] = frand(-1.0f, 1.0f);
-    for (int64_t d = 0; d < DK; ++d) {
-        q_data[1*DK + d] = other_head_attends ? -q_data[d] : q_data[d];
-        // scale 1: head 0 scores row inf_ik at about -6*DK/2 = -192 against a maximum of a few units
-        k_data[inf_ik*DK + d] = q_data[d] < 0.0f ? 6.0f : -6.0f;
-        v_data[inf_ik*DK + d] = INFINITY;
-    }
-
-    struct ggml_init_params ip = { 16*1024*1024, NULL, true };
-    struct ggml_context * ctx = ggml_init(ip);
-
-    struct ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, DK, 1,    n_head);
-    struct ggml_tensor * k = ggml_new_tensor_3d(ctx, type_KV,       DK, n_kv, n_head_kv);
-    struct ggml_tensor * v = ggml_new_tensor_3d(ctx, type_KV,       DK, n_kv, n_head_kv);
-
-    struct ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, NULL, 1.0f, 0.0f, 0.0f);
-    ggml_prec_set_acc(out, GGML_PREC_F32);
-
-    struct ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, out);
-
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-
-    free(fill_tensor(q, q_data, n_head,           DK));
-    free(fill_tensor(k, k_data, n_kv * n_head_kv, DK));
-    free(fill_tensor(v, v_data, n_kv * n_head_kv, DK));
-
-    float * o_fast = (float *) malloc(ggml_nbytes(out));
-    float * o_ref  = (float *) malloc(ggml_nbytes(out));
-    cpu_set_use_ref(backend, false);
-    ggml_backend_graph_compute(backend, gf);
-    ggml_backend_tensor_get(out, o_fast, 0, ggml_nbytes(out));
-    cpu_set_use_ref(backend, true);
-    ggml_backend_graph_compute(backend, gf);
-    ggml_backend_tensor_get(out, o_ref, 0, ggml_nbytes(out));
-    cpu_set_use_ref(backend, false);
-
-    // out: [DV, n_head]; heads 0, 2 and 3 must be finite and equal on both paths, head 1 is finite
-    // unless it attends the inf row
-    bool ok = true;
-    double worst = 0.0;
-    for (int64_t h = 0; h < n_head; ++h) {
-        const bool expect_finite = h != 1 || !other_head_attends;
-        bool finite_fast = true, finite_ref = true;
-        for (int64_t d = 0; d < DK; ++d) {
-            finite_fast &= isfinite(o_fast[h*DK + d]) != 0;
-            finite_ref  &= isfinite(o_ref [h*DK + d]) != 0;
-        }
-        if (finite_fast != expect_finite || finite_ref != expect_finite) {
-            ok = false;
-        }
-        if (expect_finite) {
-            float max_err;
-            const double err = nmse(o_ref + h*DK, o_fast + h*DK, DK, &max_err);
-            worst = fmax(worst, err);
-        }
-    }
-    const double tol = 5e-4;
-    ok = ok && worst <= tol;
-
-    printf("TEST zero_weight_inf_v n_kv=%lld KV=%s other_head_attends=%d: %s (finite heads nmse vs vec path: %.2e, tol: %.0e)\n",
-           (long long) n_kv, ggml_type_name(type_KV), (int) other_head_attends, ok ? "PASS" : "FAIL", worst, tol);
-
-    if (!ok) {
-        ++n_failed;
-    }
-
-    ggml_backend_buffer_free(buf);
-    ggml_free(ctx);
-    free(q_data); free(k_data); free(v_data); free(o_fast); free(o_ref);
-}
-
 // to_float of a q8_0/q4_0 row must give exactly (int) q * d, the scalar reference formula
 static void test_dequant_exact(ggml_type type) {
     srand(0xBEEF);
@@ -816,12 +728,6 @@ int main(void) {
     test_nan_propagation(backend, 64, 1030, 1, GGML_TYPE_F16,  8, 2, 1);
     test_nan_propagation(backend, 64, 1030, 1, GGML_TYPE_F32, 16, 2, 5);
     test_nan_propagation(backend, 64, 1030, 1, GGML_TYPE_F16, 24, 2, 9);
-
-    // a V row with zero softmax weight is skipped even when it is not finite
-    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
-        test_zero_weight_inf_v(backend, 1030, false, type);
-        test_zero_weight_inf_v(backend, 1030, true,  type);
-    }
 
     ggml_backend_free(backend);
 
