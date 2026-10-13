@@ -9689,9 +9689,6 @@ static void ggml_compute_forward_flash_attn_ext_f16_decode_group(
         const int nblk = (int) std::min((int64_t) KV_BLK, ic_end - ic0);
 
         // scores of the unmasked rows of the block for every head of the group
-        int act[KV_BLK];
-        int nact = 0;
-
         for (int j = 0; j < nblk; ++j) {
             const int64_t ic = ic0 + j;
 
@@ -9723,8 +9720,6 @@ static void ggml_compute_forward_flash_attn_ext_f16_decode_group(
                 case 7: ggml_fa_decode_scores<7>(qf, krow, DKp, scale, mv, s + j, KV_BLK); break;
                 default: ggml_fa_decode_scores<8>(qf, krow, DKp, scale, mv, s + j, KV_BLK); break;
             }
-
-            act[nact++] = j;
         }
 
         // online softmax per head: running max, rescale of the accumulator, weights of the block
@@ -9770,7 +9765,54 @@ static void ggml_compute_forward_flash_attn_ext_f16_decode_group(
             continue;
         }
 
-        // V rows of the unmasked positions, compacted, and their weights
+        // A zero weight must not touch its V row (0 * inf would be NaN), as in the per-row kernel.
+        // Rows with a non-zero weight in every head of the group are compacted and taken by the
+        // grouped kernel; a row whose weight is zero in some heads only (underflow of expf) is
+        // added per head, skipping the zero weights; masked rows and rows with zero weight in every
+        // head are skipped. A NaN weight counts as non-zero so it reaches the output
+        int act[KV_BLK];
+        int part[KV_BLK];
+        int nact = 0;
+        int npart = 0;
+
+        for (int j = 0; j < nblk; ++j) {
+            int nnz = 0;
+            for (int g = 0; g < ng; ++g) {
+                nnz += p[g*KV_BLK + j] != 0.0f;
+            }
+            if (nnz == ng) {
+                act[nact++] = j;
+            } else if (nnz > 0) {
+                part[npart++] = j;
+            }
+        }
+
+        // the partial rows first, through the last scratch row (nact < KV_BLK when npart > 0), while
+        // their weights are still in place
+        for (int jj = 0; jj < npart; ++jj) {
+            const int j = part[jj];
+            const char * v_data = (const char *) v->data + ((ic0 + j)*nbv1 + iv2*nbv2);
+            float * vrow = vf + (KV_BLK - 1)*DVp;
+            if (v->type == GGML_TYPE_F32) {
+                memcpy(vrow, v_data, DV*sizeof(float));
+            } else if (v->type == GGML_TYPE_F16) {
+                ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) v_data, vrow, DV);
+            } else {
+                v_to_float(v_data, vrow, DV);
+            }
+            for (int g = 0; g < ng; ++g) {
+                const float pj = p[g*KV_BLK + j];
+                if (pj != 0.0f) {
+                    ggml_vec_mad_f32(DV, vkq + g*DVp, vrow, pj);
+                }
+            }
+        }
+
+        if (nact == 0) {
+            continue;
+        }
+
+        // V rows of the compacted positions and their weights
         for (int jj = 0; jj < nact; ++jj) {
             const char * v_data = (const char *) v->data + ((ic0 + act[jj])*nbv1 + iv2*nbv2);
             float * vrow = vf + jj*DVp;
