@@ -1,5 +1,57 @@
 # llama.cpp
 
+> ## Ivy Bridge fork notes
+>
+> This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) at tag `b11574`, adapted for **AVX-only x86 CPUs** (AVX, F16C, SSE4.2; no AVX2, FMA or BMI), for example Xeon E5 v2 (Ivy Bridge-EP). The work is on the `ivybridge` branch. It is not an upstream contribution.
+>
+> ### What changed
+> - **Matmul:** tiled `mul_mat` / `mul_mat_id` (including MoE experts) for `q4_0`, `q5_0`, `q8_0`, `iq4_nl` and `mxfp4`, using a 128-bit SSSE3 microtile. Enabled only when AVX2 is not available.
+> - **Quantization and vector ops:** AVX `quantize_row_q8_K` (bit-exact with the reference), vectorized `rms_norm` sum of squares, 256-bit `vec_add_f32`, 256-bit `expf` / `silu` without FMA.
+> - **`vec_dot`:** F16C block-scale conversion for `q4_0` / `q8_0`, tuned `q4_K` / `q6_K` kernels.
+> - **Flash attention:** blocked KV loop, `q8_0` / `q4_0` K and V in the fast paths, AVX row dequantization, a decode kernel that processes the query heads sharing one KV head together (grouped-query attention), and tile-aligned work splitting in the prompt path.
+> - **Threading:** atomic barrier under OpenMP with yield when oversubscribed, 128-byte padding of hot counters.
+> - **Tests:** `test-tiled-mulmat` extended, new `test-quantize-q8-k`, `test-cpu-ops`, `test-vec-dot-q`, `test-flash-attn` (checked against a scalar double-precision reference), `test-barrier-stress`.
+>
+> ### Results
+> Machine: 2x Xeon E5-2697 v2, DDR3-1600, 8x16 GB. Model: a community Q4_K_M GGUF of Qwen3-Coder-30B-A3B-Instruct (abliterated). Both binaries were built with the same flags (`-march=ivybridge`, AVX2/FMA/BMI2 off).
+>
+> **Speed** (`llama-bench -t 12 -p 128 -n 32 -d 0,4096 -r 3`, pinned to one NUMA node with local memory, page cache dropped before every run, upstream and fork run alternately three times each, median [min..max], tokens/s):
+>
+> | Test | upstream `b11574` | this fork | change |
+> |---|---|---|---|
+> | prompt, empty context | 48.00 [47.61..48.34] | 50.41 [50.21..50.76] | +5.0 % |
+> | generation, empty context | 18.30 [18.22..18.32] | 18.52 [18.28..18.60] | +1.2 % (within noise) |
+> | prompt, 4096 tokens deep | 19.26 [19.22..19.28] | 29.30 [29.10..29.31] | +52 % |
+> | generation, 4096 tokens deep | 8.09 [8.08..8.12] | 12.36 [12.23..12.38] | +53 % |
+>
+> The gain is in long contexts. Generation on an empty context is not measurably faster.
+>
+> **Quality** (`llama-perplexity`, wikitext-2 test set, `-c 512 -fa on`, same weights and settings for both binaries):
+>
+> | Path | upstream `b11574` | this fork | std. error |
+> |---|---|---|---|
+> | prompt processing, 40 chunks | 8.6446 | 8.6427 | 0.258 |
+> | one token at a time (`-b 1 -ub 1`), 8 chunks | 9.7359 | 9.7230 | 0.655 |
+>
+> The differences are far below the standard error. The one-token path is the one that exercises the grouped-query decode kernel. Results are not bit-identical to upstream (summation order and `expf` evaluation differ in a few kernels).
+>
+> ### Known limitations
+> - Measured end to end on one machine and one model. The other changes (tiled matmul for the 32-element formats, `vec_dot` tuning, threading) are covered by correctness tests and micro-measurements, not by an end-to-end comparison.
+> - The grouped decode kernel is not gated by architecture. Without AVX it falls back to scalar code and may be slower than upstream. It was not benchmarked on AVX2 or AVX-512 hardware.
+> - If a V row contains `inf` or `NaN` and its softmax weight underflows to zero, the grouped decode kernel can propagate `NaN` to the whole head, where upstream would not. Weights of real models are finite.
+> - `test-backend-ops` skips the CPU backend when it is the only backend, so the new CPU code is verified by the dedicated tests above.
+>
+> ### Build
+> ```sh
+> cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+>   -DGGML_NATIVE=OFF -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_F16C=ON \
+>   -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_BMI2=OFF -DGGML_AVX512=OFF \
+>   -DCMAKE_C_FLAGS="-march=ivybridge -mtune=ivybridge" \
+>   -DCMAKE_CXX_FLAGS="-march=ivybridge -mtune=ivybridge"
+> cmake --build build -j
+> ```
+> `GGML_AVX2`, `GGML_FMA` and `GGML_BMI2` default to ON when `GGML_NATIVE=OFF`, so they have to be switched off explicitly.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
